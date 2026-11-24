@@ -73,7 +73,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, ex_style, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -99,7 +99,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, ex_style, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -115,11 +115,45 @@ pub extern "system" fn CreateWindowExA(
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+///
+/// With `VICTORY_RESOLUTION` set, a top-level window the title would make
+/// larger is instead created at the size of the picture the title draws
+/// inside a frame of that resolution, so nothing has to be stretched: the
+/// picture covers `frame height / 2160` of the frame, anchored top-left (see
+/// [`picture_size`]). Resizing the window after it exists is not an option —
+/// the title treats that as a rollback and runs its own crash handler.
+fn fit(
+    parent: HWND,
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32, i32, i32) {
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
+    if parent.is_null()
+        && known != 0
+        && let Some(picture) = requested_window()
+        // Only a window the title was making larger than the picture: a
+        // message box or a tooltip keeps its own size.
+        && width > picture.0
+        && height > picture.1
+    {
+        let (outer_w, outer_h) = outer_size(ex_style, style, picture.0, picture.1);
+        let left = area.left + (area.right - area.left - outer_w) / 2;
+        let top = area.top + (area.bottom - area.top - outer_h) / 2;
+        tracing::info!(
+            asked = ?(width, height),
+            client = ?picture,
+            outer = ?(outer_w, outer_h),
+            "title window created at the picture's size"
+        );
+        return (left, top, outer_w, outer_h);
+    }
     let fitted = fit_into(&area, width, height);
     if !parent.is_null() || known == 0 || fitted == (width, height) {
         return (x, y, width, height);
@@ -129,6 +163,48 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The console frame height the title lays its picture out for.
+const CONSOLE_HEIGHT: f64 = 2160.0;
+
+/// The picture's size inside a `width` x `height` frame: the title draws it
+/// for a 2160-tall console, anchored top-left, and leaves the rest black.
+fn picture_size(width: u32, height: u32) -> (i32, i32) {
+    let scale = f64::from(height) / CONSOLE_HEIGHT;
+    (
+        (f64::from(width) * scale).round() as i32,
+        (f64::from(height) * scale).round() as i32,
+    )
+}
+
+/// `VICTORY_RESOLUTION=1920x1080`'s picture size (960x540 there), or `None`
+/// when the switch is unset.
+fn requested_window() -> Option<(i32, i32)> {
+    static SIZE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let text = std::env::var("VICTORY_RESOLUTION").ok()?;
+        let (w, h) = text.split_once('x')?;
+        let (w, h): (u32, u32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+        Some(picture_size(w, h))
+    })
+}
+
+/// The outer size that gives a `width` x `height` client area with `style`
+/// and `ex_style` (the frame a title window has).
+fn outer_size(ex_style: u32, style: u32, width: i32, height: i32) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    // SAFETY: a metrics call on a live RECT; the menu flag is false.
+    let adjusted = unsafe { wm::AdjustWindowRectEx(&mut rect, style, 0, ex_style) };
+    if adjusted == 0 {
+        return (width, height);
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits

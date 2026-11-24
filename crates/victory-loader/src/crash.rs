@@ -30,6 +30,17 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
 pub(crate) const MAX_FRAMES: usize = 40;
 
+/// An `int3` the title is known to reach and that is not a fault: stepping
+/// over it lets a patched run continue (the resolution cap reaches one).
+static STEP_OVER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Debugging aid: the `int3` at `address` is stepped over (`Rip += 1`, as a
+/// debugger would) instead of being reported as a first-chance breakpoint.
+/// Off until called.
+pub fn step_over_breakpoint_at(address: usize) {
+    let _ = STEP_OVER.set(address);
+}
+
 /// Memory saved to files when a crash is reported: (address, length, file).
 #[cfg(feature = "diagnostics")]
 static SAVE: std::sync::OnceLock<Vec<(usize, usize, std::path::PathBuf)>> =
@@ -356,8 +367,36 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// Steps over a configured `int3`, and only that one.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
+    let Some(&address) = STEP_OVER.get() else {
+        return false;
+    };
+    // SAFETY: the system passed valid exception pointers; a breakpoint's
+    // context has a usable `Rip`.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        if record.ExceptionCode != EXCEPTION_BREAKPOINT {
+            return false;
+        }
+        let context = &mut *(*info).ContextRecord;
+        if context.Rip as usize != address {
+            return false;
+        }
+        context.Rip = context.Rip.wrapping_add(1);
+    }
+    true
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
+    if unsafe { step_over(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as before.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }

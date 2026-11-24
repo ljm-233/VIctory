@@ -69,6 +69,12 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+To run below the console's 4K (a 16 GB host with an 8 GB card otherwise runs
+out at the menus), cap the title's resolution ladder with
+`VICTORY_RESOLUTION=1920x1080`. The title then renders at 1920x1080, its
+window is created at the size of the picture it draws (960x540) and shown
+1:1, and a scaled display does not stretch it again.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.

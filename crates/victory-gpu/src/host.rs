@@ -1461,6 +1461,100 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The corner of the frame to present, when the swap chain is the
+    /// window's client area rather than the frame's size
+    /// (`VICTORY_RESOLUTION`).
+    crop: Option<(u32, u32)>,
+}
+
+/// The height the title lays its picture out for (a Series X frame). The
+/// picture is `frame height / 2160` of the frame, anchored top-left; the
+/// rest of the frame is black.
+const CONSOLE_HEIGHT: f64 = 2160.0;
+
+/// The swap chain size and source box for presenting a `width` x `height`
+/// frame into `hwnd`.
+///
+/// With `VICTORY_RESOLUTION` the title's window is created at the picture's
+/// size (see the life cycle module), so the swap chain is made the window's
+/// client area and only the picture's corner is copied, 1:1. Presenting the
+/// whole frame into the smaller window instead would let DXGI scale the
+/// frame (picture included) down to the window: still a small picture, now
+/// blurry.
+fn presentation(width: u32, height: u32, hwnd: HWND) -> (u32, u32, Option<(u32, u32)>) {
+    if !window_crop() || hwnd.is_invalid() {
+        return (width, height, None);
+    }
+    let mut client = RECT::default();
+    // SAFETY: a plain query on a window of this process.
+    if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+        return (width, height, None);
+    }
+    let (cw, ch) = (
+        (client.right - client.left).max(0) as u32,
+        (client.bottom - client.top).max(0) as u32,
+    );
+    if cw == 0 || ch == 0 || (cw >= width && ch >= height) {
+        return (width, height, None);
+    }
+    let scale = f64::from(height) / CONSOLE_HEIGHT;
+    // The picture's corner, bounded by the frame: a frame at or above the
+    // console height is wholly picture, and the copy scales it into the
+    // client rather than cropping it.
+    let content = (
+        (f64::from(width) * scale).round().clamp(1.0, f64::from(width)) as u32,
+        (f64::from(height) * scale).round().clamp(1.0, f64::from(height)) as u32,
+    );
+    (cw, ch, Some(content))
+}
+
+/// `VICTORY_RESOLUTION=1920x1080` (see the life cycle module), read once.
+fn window_crop() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESOLUTION").is_some())
+}
+
+/// Copies the source (all of it, or its `crop` corner) onto `back`.
+///
+/// # Safety
+///
+/// `back` and `source` are live textures in copy source/destination states,
+/// and `source`'s top-left `crop` corner is inside it.
+unsafe fn copy_picture(
+    list: &ID3D12GraphicsCommandList,
+    back: &ID3D12Resource,
+    source: &ID3D12Resource,
+    crop: Option<(u32, u32)>,
+) {
+    let Some((sw, sh)) = crop else {
+        // SAFETY: the caller's contract.
+        unsafe { list.CopyResource(back, source) };
+        return;
+    };
+    let location = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    let (mut dst, mut src) = (location(back), location(source));
+    let corner = D3D12_BOX {
+        left: 0,
+        top: 0,
+        front: 0,
+        right: sw,
+        bottom: sh,
+        back: 1,
+    };
+    // SAFETY: the caller's contract; the box is inside `source`.
+    unsafe {
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&corner));
+        // The location's resource is `ManuallyDrop` (it mirrors the C
+        // struct, which is never dropped), so the references these two
+        // clones added are released here: a retained back buffer would keep
+        // the swap chain unavailable for `ResizeBuffers`.
+        std::mem::ManuallyDrop::drop(&mut dst.pResource);
+        std::mem::ManuallyDrop::drop(&mut src.pResource);
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1606,16 +1700,39 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
-        if (p.width, p.height, p.format) != (width, height, format) {
+        let (chain_width, chain_height, crop) = presentation(width, height, p.hwnd);
+        if (p.width, p.height, p.format) != (chain_width, chain_height, format) || p.crop != crop {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                p.swap_chain.ResizeBuffers(
+                    BUFFERS,
+                    chain_width,
+                    chain_height,
+                    format,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    if window_crop() {
+                        tracing::info!(
+                            width = chain_width,
+                            height = chain_height,
+                            frame = ?(width, height),
+                            crop = ?crop,
+                            "swap chain resized"
+                        );
+                    }
+                    (p.width, p.height, p.format) = (chain_width, chain_height, format);
+                    p.crop = crop;
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    tracing::warn!(
+                        error = %e,
+                        width = chain_width,
+                        height = chain_height,
+                        "swap chain not resized"
+                    );
                     return None;
                 }
             }
@@ -1637,7 +1754,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            copy_picture(list, &back, texture, p.crop);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -1679,12 +1796,13 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        let (chain_width, chain_height, crop) = presentation(width, height, hwnd);
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: width,
-                Height: height,
+                Width: chain_width,
+                Height: chain_height,
                 Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
@@ -1700,15 +1818,23 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width = chain_width,
+                height = chain_height,
+                frame = ?(width, height),
+                crop = ?crop,
+                format = format.0,
+                "presenting to a window"
+            );
             Ok(Presenter {
                 swap_chain,
-                width,
-                height,
+                width: chain_width,
+                height: chain_height,
                 format,
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                crop,
             })
         }
     }

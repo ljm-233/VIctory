@@ -18,6 +18,26 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    // `VICTORY_RESOLUTION=1920x1080`: run the title below its console's 4K by
+    // capping its resolution ladder (see `victory_game::output`). The window
+    // is created at the picture's size and the frame is shown 1:1, so the
+    // size must be the same everywhere, and a scaled display must not scale
+    // it: set before this process makes any window.
+    let resolution = std::env::var("VICTORY_RESOLUTION").ok().and_then(|text| {
+        let (w, h) = text.split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    });
+    if resolution.is_some() {
+        use windows_sys::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        // SAFETY: a process-wide setting, called before any window exists.
+        let aware =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if aware == 0 {
+            eprintln!("resolution     the process could not become DPI aware; the frame is scaled");
+        }
+    }
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
@@ -32,6 +52,38 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    if let Some((width, height)) = resolution {
+        let base = image.base();
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image is mapped; its sections may be read-only pages,
+        // so the whole image is made writable for the rewrite. It stays
+        // writable: VirtualProtect reports one page's former protection for
+        // the whole range, so restoring it would clear `.text`'s execute
+        // bit on every page after the first.
+        let writable = unsafe {
+            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+            let mut before = 0u32;
+            VirtualProtect(
+                base as *const core::ffi::c_void,
+                size,
+                PAGE_EXECUTE_READWRITE,
+                &mut before,
+            ) != 0
+        };
+        if writable {
+            // SAFETY: the image is writable for `size` bytes, as above.
+            let changed =
+                unsafe { victory_game::output::cap_ladder(base as *mut u8, size, width, height) };
+            println!("resolution     {changed} ladder entry(ies) capped to {width}x{height}");
+            // SAFETY: the image is readable for `size` bytes.
+            if let Some(at) = unsafe { victory_game::output::assert_site(base, size) } {
+                victory_loader::step_over_breakpoint_at(at);
+                println!("resolution     int3 at {at:#x} steps over (pool-offset check)");
+            }
+        } else {
+            eprintln!("resolution     the image could not be made writable; no patch");
+        }
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
