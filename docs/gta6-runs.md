@@ -307,3 +307,175 @@ GPU 时间一路压到 608 ms（从 9327），帧时间只从 16420 降到 10192
 
 **能做的 N 卡接口已经做完了**：`VK_NV_raw_access_chains` 默认开、`VICTORY_INPLACE=2` 保持、
 `VICTORY_CARD_RESERVE` 不开。剩下的 160 MB/帧搬不动，是 swap 的事，不是显卡的事。
+
+## 十五、跟进上游：没走 merge，改成一个一个重做
+
+上游 `Marvisak/VIctory` 比我们的基准（`ffe310e`）多 **319 个 commit**。其中对我们有用的是最新两条：
+
+- `cd94d35` — shaders 穿过 view 写的页打标记，copy-back 只比对打了标记的页。
+  上游自己的数字：每帧 2.8-4.5 GB 快照 → 只比标记过的页，1.5-1.7 s 的过场帧里省 0.45-0.7 s
+- `940d32f` — 被标记的页 copy-back 时不给自己存一份
+
+### 为什么没整 branch merge
+
+试过，11 个文件 35 块冲突，解到 8 个时发现三个是**模型级**冲突，不是文本级：
+
+| 模块 | 我们/1k-fresh 的 | 上游的 |
+|---|---|---|
+| `watch.rs` | `writes()` 自由函数 + `Journal.written` 用 `HashMap`（省每页 log-n 插入） | 整个重写成 `Tracked` 句柄模型，`writes()` 这个函数**没有了**，新增 `Changed`/`Saved`（给 view-marks 存页） |
+| `texture.rs` | 问 write watch，省下每帧 10.6 MB 的 hash | 每帧算 hash（`last.hash`），`refresh_timed` 返回从 `usize` 改成 `(usize, bool)` |
+| `shadow.rs` | 用户态拷贝那条线，207 行 | view-marks + copy-back 标记，377 行 |
+
+两边对同一个问题给了相反的答案。硬合会丢掉已验证的优化，所以中止了，改成在最新上游上**一件一件重做**。
+
+### 重做出来的（分支 `redo/on-upstream`，base `940d32f`）
+
+```
+d3c1fc2 gpu: copy title memory in user space where both ends are there
+34de511 gpu: the shader cache key includes the wave64 switches
+0aace67 shaders: fix the hand-written module datalayout
+db5e52a shaders: a heap handle's identity includes its component type
+f48665d shaders: emulate wave64 compute on 32-lane host waves through LDS
+940d32f (upstream) GPU: a marked page's copy-back does not save the page for its own copy
+```
+
+五个都编译通过，`cargo build --release` 干净。
+
+**四项是我们自己那套，上游已经有了等效或更好，不用重做**：
+
+| 我们做的 | 上游 |
+|---|---|
+| translator key（`VICTORY_SHADER_CACHE_KEY`） | `build.rs` 的 `VICTORY_SHADER_SOURCE_HASH` + `ENCODING`，本来就是 translator-keyed |
+| 纹理队列退避改墙钟 | 上游把「按索引取纹理」那个队列**整个去掉了**（`TextureQueue`、`texture_slots_due`、`heap_textures` 都不在） |
+| PR 701（behind guard 用 hash 判断） | 上游纹理本来每帧 hash，不会重复上传 |
+| card compare（97 copies / 941 MB） | 上游的 view-marks 更彻底，不用把 copy 搬上卡 |
+
+### 跑起来的第一个问题：缺 in-place
+
+`/tmp/run-redo.log` 跑到 12 draws 时崩在 `vkAllocateMemory` 里
+（`Exception 0xc0000005 in Unix call`）。日志里：
+
+```
+host textures: 2042 (5650 MB, 162 MB of them used by lists)
+host pipeline library saved ... made=656 created=84238 distinct=83548
+shader translated ... ms=2795 / 2906 / 3840 / 3517 / 3256（最长 23950）
+```
+
+- `created=84238` **不是 bug**：`note_created`（`make.rs:213`）在标题创建 pipeline 时就计数，
+  GTA6 这三分钟真的要了 8.4 万个 PSO，造出来 656 个，其余没被 draw 用到
+- 单次翻译 2.4-23.9 秒，**比 fork 版的 2.35 ms 慢三个数量级** —— view-marks 的代价，要看
+- **真因是缺 in-place**：整份日志里没有 `title memory in place` 一行，`VICTORY_INPLACE=2` 被忽略。
+  fork 版有 364 MB title 内存直接给 GPU 读、不占显存；上游版全要拷贝，
+  5650 MB 纹理 + pipeline 内存就顶爆了 8 GB 的卡
+
+`inplace.rs` 现在在 `git stash`（1k-fresh 的「VA line」那 62 行未提交改动），
+基于旧上游写的，拿回来要重新适配 —— **这是下次的第一件事**。
+
+## 十六、上游 PR 里对症的（已经拿了四个）
+
+`gh pr list --repo Marvisak/VIctory --state open` 里有几十条，四条正好打在我们的问题上：
+
+| PR | 规模 | 打在哪儿 |
+|---|---|---|
+| **#2389** streamed textures 只占标题实际持有的 mip 等级 | +870/−15，6 文件 | 显存爆。开关 `VICTORY_LEVELS_ON_DEMAND=1`。实测纹理 **5650 MB → 4773 MB**（3220 个纹理） |
+| **#2349** 更便宜的 title 内存拷贝、refresh、copy-back | +633/−135，3 文件 | copies。**它不做页表预扫描**：直接 `copy_nonoverlapping`，靠 SEH（`victory_copy_fast` + `recover_copy`）把 fault 重定向回内核拷贝。有洞的范围现在只付一次 fault，不是四遍页表扫描 |
+| **#2363** descriptor 的 dword 当数据读（record count 和 format） | +58/−19，3 文件 | 我们那 5 个失败 shader 里的 3 个 |
+| **#2347** spilled lane masks、Atom::Phi 回边、carry masks | +255/−74，2 文件 | `f133e35efed2a48a` 那个 lane mask |
+
+四个都打上、编译通过（分支 `redo/on-upstream`）：
+
+```
+b799841 GPU: streamed textures take video memory only for the levels the title holds (#2389)
+fc4c666 GPU: cheaper title memory copies, refresh batches and copy-back (#2349)
+6860e8d Shaders: track spilled lane masks, Atom::Phi back-edges, and carry masks (#2347)
+fccb158 GPU: descriptor dwords read as data — the record count and the format (#2363)
+d3c1fc2 gpu: copy title memory in user space where both ends are there
+34de511 gpu: the shader cache key includes the wave64 switches
+0aace67 shaders: fix the hand-written module datalayout
+db5e52a shaders: a heap handle's identity includes its component type
+f48665d shaders: emulate wave64 compute on 32-lane host waves through LDS
+940d32f (upstream) GPU: a marked page's copy-back does not save the page for its own copy
+```
+
+`#2349` 里那条 SEH 拷贝正是我原来想的方案 C，比手写的 `readable`/`writable` 预扫描强，
+所以把它自己那版覆盖掉了（`d3c1fc2` 被 `fc4c666` 替换）。
+
+### 跑起来的结果
+
+**过了原来 `vkAllocateMemory` 崩的那个点**（上次 12 draws / 3 分钟崩，这次跑了 9 分钟）。
+纹理稳在 4773-4788 MB。
+
+但**新崩点在 `vkCreateComputePipelines`**：
+
+```
+WARN host pipeline refused error=0x80004005 shaders=[compute 7cb338ecaeac0aa9]
+WARN host pipeline refused error=0x80004005 shaders=[compute 5d061e6aed59c57d]
+026c:err:vulkan:vkCreateComputePipelines Exception 0xc0000005 in Unix call.
+```
+
+而且 `shader does not translate` 从 fork 版的 3 个涨到 **12 个**，新的拒绝文本是
+`0x4d0: a descriptor neith...` 和 `0x14dc: a lane mask read ...` ——
+**`#2363` 或 `#2347` 引入了新的翻译拒绝路径**，vkd3d 拒了 pipeline 之后崩。
+
+下次的第一件事：逐个撤 `#2363` / `#2347` 二分，看 12 个失败降到几个。
+
+## 十七、游戏退出后内存和显存不释放（已解决）
+
+现象：游戏进程没了，`free` 还是 14.8 GB 用着、`nvidia-smi` 还剩 6775 MiB 显存。
+
+原因：wine 的 `explorer.exe`、`qq` 之类的实例在游戏退出后继续挂着 `/dev/nvidia0`
+和 `/dev/nvidia-ctl` 的映射。`nvidia-smi --query-compute-apps` 看不到它们（它们不是 compute 进程）。
+
+**解法：`wineserver -k`**。实测释放 7 GB 内存 + 6.7 GB 显存（6775 MiB → 52 MiB），
+内存 14879 MB → 7599 MB。
+
+脚本在 `/tmp/cleanup-gta6.sh`，每轮跑完执行一次。
+
+另外 `/tmp` 里之前子代理留下的诊断目录（`diag-capture2` 340 MB、`diag-capture3` 237 MB 等）
+占了 1.3 GB，也一并清了。
+
+## 十八、进世界了：四个开关把 pipeline 队列排空
+
+作者主线 `line/main`（PR #2 + #3，比我们推的分支多 208 个 commit）加四个开关：
+
+```bash
+export VICTORY_INDIRECT_WINDOW=1
+export VICTORY_TEXTURE_NO_WAIT=1
+export VICTORY_SHADER_LOOP_LIMIT=1024
+export VICTORY_TEXTURE_ROOM_PERCENT=82
+```
+
+**结果**：
+
+| | 之前 | 这轮 |
+|---|---|---|
+| `being made` | 1274-1830，**永远不动** | 1404 → **4**（排空） |
+| draws 峰值 | 6863 | **10537** |
+| 帧率 | 1.9 fps，5.5 秒一帧 | 22-25 fps（加载期），进世界后 0.1 fps |
+| copies | 1750 ms / 98 MB | 2-4 ms / 1.4 MB（加载期），进世界 1180 ms / 92 MB |
+| 崩溃 | 常崩 | 0 |
+
+draws 的曲线：11-15 持续到 16:54:22，然后 16:54:54 一跳 **1571 → 7252 → 10537**。
+
+**之前最高的 6863 是从没进过世界的峰值**（那时候是掉帧前的瞬间），这轮是真正的世界帧。
+
+`VICTORY_INDIRECT_WINDOW=1` 最可能是解 `being made` 卡死的那个：间接执行的窗口在等，和 pipeline 卡死的表现一样。但没做 A/B，不确定是它单独还是四个一起。
+
+**还有 2038 个 draw 在等 pipeline**（最后一帧 `dropped 2038 without a host pipeline`），说明主队列排空了但新 pipeline 还在持续要。这是下一步：把 PR #3 那个「每条待编译管线只在首次请求的帧等待」的逻辑用上。
+
+## 十九、用户给的 xss 配置里只有四个在这条线上存在
+
+他给的 12 个开关，`line/main` 里只有 4 个：
+
+| 存在 | 不存在（在那个领先分支 `queue2.rs` 那套里） |
+|---|---|
+| `VICTORY_INDIRECT_WINDOW` | `VICTORY_JOIN_PARTS` |
+| `VICTORY_TEXTURE_NO_WAIT` | `VICTORY_BACK_OWN_VIEW` |
+| `VICTORY_SHADER_LOOP_LIMIT` | `VICTORY_ASYNC_SUBMIT` |
+| `VICTORY_TEXTURE_ROOM_PERCENT` | `VICTORY_QUEUE2` |
+| | `VICTORY_COPY_PLAIN` |
+| | `VICTORY_MERGE_GAP` |
+| | `VICTORY_MERGE_RUNS` |
+| | `VICTORY_LEVELS_ON_DEMAND` |
+
+那 8 个要在 2222.rar 那个分支里才有（`queue2.rs` 1047 行双 copy queue、`drvwatch.rs`、`cardmeter.rs`）。
