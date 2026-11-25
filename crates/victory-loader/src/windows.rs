@@ -90,8 +90,41 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path = %loaded.path.display(),
         "image mapped"
     );
+    if !loaded.info.is_dll() && std::env::var_os("VICTORY_PATCH_TRAP").is_some() {
+        patch_trap(loaded.base());
+    }
     crate::threads::mapped(&loaded);
     Ok(loaded)
+}
+
+/// Test-only: replaces the two conditional jumps that lead into the title's `int3` at
+/// `+0x1330A44` with nothing, so a run continues past the assert instead of dying on it.
+///
+/// `+0x1330970` is `je +0x1330A44` (six bytes) and `+0x1330A34` is a short `je` to the other
+/// `int3` (two bytes). Neither changes the check's result, only what happens on failure.
+fn patch_trap(base: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    let patches: [(usize, usize); 2] = [(0x1330970, 6), (0x1330A34, 2)];
+    for (rva, len) in patches {
+        let at = base + rva;
+        let mut old = 0u32;
+        // SAFETY: the image is mapped and no title code has run yet.
+        let changed = unsafe { VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0;
+        if !changed {
+            tracing::warn!(at = format_args!("{at:#x}"), "diagnostic: could not unprotect the trap jump");
+            continue;
+        }
+        // SAFETY: `len` bytes at `at` were just made writable.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0x90, len) };
+        let mut back = 0u32;
+        // SAFETY: restoring the protection the mapping had.
+        unsafe { VirtualProtect(at as *const _, len, old, &mut back) };
+        tracing::warn!(
+            at = format_args!("{at:#x}"),
+            len,
+            "diagnostic: a jump into the +0x1330A44 trap was replaced with nops (VICTORY_PATCH_TRAP)"
+        );
+    }
 }
 
 /// Maps the DLLs the title ships in `title_dir` that `main` imports,
@@ -183,13 +216,8 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    crate::publish::write_if_changed(path, bytes)
+        .with_context(|| format!("publishing {}", path.display()))
 }
 
 impl LoadedImage {

@@ -1,2 +1,2 @@
-[alias]
+﻿[alias]
 xtask = "run --quiet --package xtask --"

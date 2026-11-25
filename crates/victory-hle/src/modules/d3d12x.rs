@@ -49,6 +49,22 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Translates one console shader container into the shader cache
+/// (`use_shader_cache`'s folder), for the offline warm-up: `Ok(true)` when
+/// the entry was already there, `Ok(false)` when it was translated now, and
+/// `Err` when the translator refuses the container (the refusal is recorded
+/// too, as a run would record it).
+#[cfg(windows)]
+pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+    victory_gpu::shader_cache::warm(container)
+        .map(|w| w == victory_gpu::shader_cache::Warmed::Cached)
+}
+
+#[cfg(not(windows))]
+pub fn warm_shader(_: &[u8]) -> Result<bool, String> {
+    Err("no shader translation without the host backend".to_owned())
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
