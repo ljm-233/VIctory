@@ -5,6 +5,10 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+#[cfg(feature = "diagnostics")]
+#[path = "model_coverage.rs"]
+mod coverage;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -712,6 +716,8 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    #[cfg(feature = "diagnostics")]
+    samples: Mutex<coverage::Samples>,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -1442,11 +1448,13 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one 256-thread group per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// `differs` gets a dword per piece, 1 where a byte differs. Each thread reads
+/// coalesced 16-byte chunks at 4 KiB stride and reduces through groupshared
+/// memory. The offsets are widened to 16 bytes; buffers are multiples of
+/// 64 KiB, and a piece flagged for a byte just outside the range costs a
+/// fetch that finds nothing.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1462,32 +1470,79 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 acc[256];
 [RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    if (gid.x >= pieces) return;
+    uint piece = first + gid.x;
+    uint tid = gtid.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)
+        ^ uint4(tid * 0x01000193u, tid * 0x9E3779B1u, tid * 0x85EBCA77u, tid * 0xC2B2AE3Du);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
+    for (uint at = lo + tid * 16u; at < hi; at += 256u * 16u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+    acc[tid] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            uint4 other = acc[tid + stride];
+            h = (h ^ (other.wxyz + uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)))
+                * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            acc[tid] = h;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        if (compare != 0u) {
+            differs.Store(out_at + gid.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            // With the copy-back on its own thread: the next compare of the
+            // piece finds what is written from here on.
+            if (compare == 2u) hashes.Store4(piece * 16u, h);
+        } else {
+            hashes.Store4(piece * 16u, h);
+        }
     }
 }
 "#;
+
+/// Dispatches [`CARD_COMPARE`] in chunks within D3D12's per-dimension
+/// group limit (`65_535`).
+///
+/// # Safety
+/// The list is open for compute with `CARD_COMPARE`'s root signature and
+/// resources bound for `[first, first + pieces)`.
+unsafe fn dispatch_card_compare(
+    list: &ID3D12GraphicsCommandList,
+    first: u32,
+    skew: u32,
+    size: u32,
+    pieces: u32,
+    out_at: u32,
+    compare: u32,
+) {
+    const MAX_GROUPS: u32 = 65_535;
+    let mut done = 0u32;
+    while done < pieces {
+        let n = (pieces - done).min(MAX_GROUPS);
+        let constants = [first + done, skew, size, n, out_at + done * 4, compare];
+        // SAFETY: caller ensures `list` has `CARD_COMPARE` and its resources bound.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(n, 1, 1);
+        }
+        done += n;
+    }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -2836,6 +2891,8 @@ impl Host {
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
+                samples: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
@@ -3075,9 +3132,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
                         }
                     }
                     list.Close()?;
@@ -3158,11 +3213,17 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        dispatch_card_compare(
+                            list,
+                            r.span.first,
+                            r.span.skew,
+                            size as u32,
+                            r.span.pieces,
+                            r.at * 4,
+                            if flown { 2 } else { 1 },
+                        );
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -3919,7 +3980,7 @@ impl Host {
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
+                        && shadow.kernel_watched()
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -4038,6 +4099,15 @@ impl Host {
                         working(true);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            if coverage::enabled() {
+                // SAFETY: a nonblocking query of our queue fence. UINT64_MAX denotes device removal.
+                let completed=unsafe {self.fence.GetCompletedValue()};
+                if completed!=u64::MAX && completed>=*submitted {
+                    if timing() {runs[i].save_draw_samples(this_submission);}
+                    else {for list in runs {list.save_draw_samples(this_submission);}}
                 }
             }
             // With timing on each group is one of `runs` (and the compare
@@ -4407,6 +4477,8 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
+        if coverage::enabled() {self.samples.lock().unwrap_or_else(|e|e.into_inner()).resolve(&self.list);}
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -4435,6 +4507,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.samples.lock().unwrap_or_else(|e|e.into_inner()).reset();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -5256,23 +5330,29 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
+                .filter(|r| r.0.kernel_watched())
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
+            // Each batch chunk on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                .collect();
+            let each = self.refreshes.len().div_ceil(16);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(16);
+            while !self.refreshes.is_empty() {
+                let at = self.refreshes.len().saturating_sub(each);
+                let chunk: Vec<_> = self.refreshes.drain(at..).collect();
+                jobs.push(Box::new(move || {
+                    for (shadow, from, to) in chunk {
+                        Self::update(&shadow, from, to);
+                    }
+                }));
+            }
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);

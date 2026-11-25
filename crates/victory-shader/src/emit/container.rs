@@ -236,14 +236,12 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            // PSV offsets describe semantic occurrences in signature order.
+            // Reusing a TEXCOORD string here disagrees with the SDK validator.
+            let offset = strings.len();
+            strings.extend(e.name.bytes());
+            strings.push(0);
+            offset
         } else {
             0
         };
@@ -300,10 +298,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.

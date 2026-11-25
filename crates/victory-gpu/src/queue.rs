@@ -746,7 +746,7 @@ fn system_timestamp() -> u64 {
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "diagnostics")]
-pub(crate) fn presented() -> u64 {
+pub fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
@@ -810,6 +810,7 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::capture::poll_room_request(frame);
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }

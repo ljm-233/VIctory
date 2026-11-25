@@ -679,7 +679,7 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, USER_VIEW_NONEMPTY};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -696,17 +696,20 @@ impl State {
                 _ => 0,
             };
         }
-        if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
+        if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 && kind != USER_VIEW_NONEMPTY {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
         }
         // The title address of the buffer view at that dword of the table.
-        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+        let range = match self.roots_ref(compute).get(usize::from(slot)) {
             Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
-            _ => 0,
+                .and_then(|view| crate::descriptor::host::buffer_range(&view)),
+            _ => None,
         };
+        if kind == USER_VIEW_NONEMPTY {
+            return u32::from(range.is_some_and(|(address, size)| address != 0 && size != 0));
+        }
+        let address = range.map_or(0, |(address, _)| address);
         if address == 0 {
             once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
         }
@@ -1775,6 +1778,17 @@ impl State {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                    if slot == 3
+                        && stage.shader.stage == "mesh"
+                        && stage.root_srvs.iter().any(|&(s, _)| s == slot)
+                        && crate::capture::room_frame(crate::queue::presented() + 1)
+                    {
+                        if let Some(tag) = host.and_then(|(_, left)| {
+                            crate::capture::geometry_identity::identify(*address, left as u64)
+                        }) {
+                            text.push_str(&tag);
+                        }
+                    }
                 }
             }
         }
@@ -1808,7 +1822,7 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    let _sample = list.sampled_draw(true, || self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
@@ -2138,7 +2152,7 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let _sample = list.sampled_draw(true, || self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2239,7 +2253,7 @@ impl State {
         let ran = !lost && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            let _sample = list.sampled_draw(true, || self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2440,7 +2454,7 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
+        let sample = list.sampled_draw(kind != DISPATCH, || {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         if kind == MESH {
@@ -2458,6 +2472,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        drop(sample);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -2655,7 +2671,10 @@ fn describe(view: Option<&View>) -> String {
         {
             // SAFETY: 16 committed bytes of title memory.
             let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+            match crate::capture::room_constant(*address, *size) {
+                Some(file) => format!("Constant({address:#x}, {size}) {v:?} sample={file}"),
+                None => format!("Constant({address:#x}, {size}) {v:?}"),
+            }
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }

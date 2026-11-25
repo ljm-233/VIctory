@@ -144,7 +144,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, #[cfg(feature = "diagnostics")] archive_path: name.replace('\\', "/").trim_start_matches("G:/").to_ascii_lowercase() });
     put(out, file)
 }
 
@@ -257,6 +257,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
+    #[cfg(feature = "diagnostics")]
+    archive_path: String,
     file: std::fs::File,
 }
 
@@ -451,6 +453,8 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        #[cfg(feature = "diagnostics")]
+        if result.is_ok() { note_archive_read(&job.request); }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -782,6 +786,33 @@ extern "system" fn submit(this: QueueRef) {
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
+}
+
+/// Log completed archive payload reads alongside the last presented frame.
+#[cfg(feature = "diagnostics")]
+fn note_archive_read(request: &Request) {
+    use std::io::Write;
+    type Report = std::io::BufWriter<std::fs::File>;
+    static REPORT: std::sync::OnceLock<Option<std::sync::Mutex<Report>>> = std::sync::OnceLock::new();
+    let writer = REPORT.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_SCENE_ASSET_IO")?;
+        let file = std::fs::File::create(path).ok()?;
+        let mut out = Report::with_capacity(64 * 1024, file);
+        writeln!(out, "frame\tarchive\toffset\tsource_bytes\tdestination_bytes\toptions\tlinear_destination").ok()?;
+        Some(std::sync::Mutex::new(out))
+    });
+    let Some(writer) = writer else {return;};
+    if request.options & MEMORY_SOURCE != 0 {return;}
+    // A successful file request still owns the file for the duration of this worker.
+    let archive = &unsafe { &*request.source.cast::<Instance<File>>() }.state.archive_path;
+    if !archive.ends_with(".rpf") {return;}
+    let mut out = writer.lock().unwrap_or_else(|e| e.into_inner());
+    let frame = victory_gpu::queue::presented();
+    let linear = if request.options & PAGE_DESTINATION == 0 { format!("{:#x}",request.destination as usize) } else { String::new() };
+    if let Err(err) = writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t{}",frame,archive,request.offset,request.source_size,request.destination_size,request.options,linear) {
+        tracing::error!(%err, "scene asset read report write failed");
+    }
+    if out.buffer().len() > 48 * 1024 { let _ = out.flush(); }
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.

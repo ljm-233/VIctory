@@ -35,7 +35,9 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
-    /// Whether the memory is write-watched: unknown, yes, no.
+    /// Asking after which every page of the copy was synced (0: never).
+    synced_at: AtomicU64,
+    /// Whether the memory is write-watched: unknown, kernel, not watched, or guarded.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
@@ -846,7 +848,16 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
+const WATCHED_KERNEL: u8 = 1;
 const NOT_WATCHED: u8 = 2;
+const WATCHED_GUARDED: u8 = 3;
+
+fn watch_state(kind: crate::watch::WatchKind) -> u8 {
+    match kind {
+        crate::watch::WatchKind::Kernel => WATCHED_KERNEL,
+        crate::watch::WatchKind::Guarded => WATCHED_GUARDED,
+    }
+}
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -1660,6 +1671,14 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether asking the kernel write watch makes sense for this copy.
+    pub(crate) fn kernel_watched(&self) -> bool {
+        !matches!(
+            self.watched.load(Ordering::Relaxed),
+            NOT_WATCHED | WATCHED_GUARDED
+        )
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -1705,6 +1724,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            synced_at: AtomicU64::new(0),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2248,7 +2268,8 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+        let state = self.watched.load(Ordering::Relaxed);
+        if state == NOT_WATCHED {
             return true;
         }
         let base = start / PAGE;
@@ -2260,9 +2281,16 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let since = self.synced_at.load(Ordering::Relaxed);
+            let Some((kind, now, written)) =
+                crate::watch::writes_since(a, e, true, state == WATCHED_GUARDED, since)
+            else {
                 return true;
             };
+            self.watched.store(watch_state(kind), Ordering::Relaxed);
+            if since > 0 && written.is_empty() {
+                continue;
+            }
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 written
@@ -2386,10 +2414,22 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+        let state = self.watched.load(Ordering::Relaxed);
+        if state != NOT_WATCHED {
+            let since = self.synced_at.load(Ordering::Relaxed);
+            if let Some((kind, now, written)) =
+                crate::watch::writes_since(from, to, true, state == WATCHED_GUARDED, since)
+            {
+                self.watched.store(watch_state(kind), Ordering::Relaxed);
+                let copied = if since > 0 && written.is_empty() {
+                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                    if from <= start && to >= end {
+                        self.synced_at.fetch_max(now, Ordering::Relaxed);
+                    }
+                    0
+                } else {
+                    self.copy_stale(from, to, now, &written)
+                };
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2443,6 +2483,10 @@ impl Shadow {
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if from <= start && to >= end {
+            self.synced_at.fetch_max(now, Ordering::Relaxed);
         }
         bytes
     }

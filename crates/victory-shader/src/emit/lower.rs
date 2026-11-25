@@ -2571,6 +2571,30 @@ impl<'a> Lower<'a> {
         })
     }
 
+    // A boolean represents NUM_RECORDS only for direct equality tests against
+    // zero. A numeric use or a phi must still obtain the actual record count.
+    fn only_zero_tests(&self, value: Value) -> bool {
+        let mut compared = false;
+        for block in &self.x.p.blocks {
+            if block.phis.iter().any(|phi| phi.args.contains(&value)) {
+                return false;
+            }
+            for i in &block.insts {
+                if !i.reads.iter().any(|r| r.1 == value) {
+                    continue;
+                }
+                let Fields::Sop { src, .. } = &i.fields else { return false };
+                if !matches!(i.name(), "s_cmp_eq_u32" | "s_cmp_lg_u32")
+                    || !src.iter().any(|v| matches!(v, Operand::Const(128) | Operand::Literal(0)))
+                {
+                    return false;
+                }
+                compared = true;
+            }
+        }
+        compared
+    }
+
     /// The title address (low dword, bits from 32 up) of the buffer view
     /// whose descriptor the scalar load at `site` reads from the start of
     /// a table entry, as the host tells it when it binds (`shader.rs`
@@ -5563,11 +5587,21 @@ impl<'a> Lower<'a> {
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
+                let nonempty = if count >= 3
+                    && inst.write(Reg::S(code + 2)).is_some_and(|v| self.only_zero_tests(v))
+                {
+                    let a = self.scalar[&site];
+                    let slot = self.x.native.layout[a.param].slot;
+                    Some(self.host_word(RootType::Other(super::shader::USER_VIEW_NONEMPTY), slot, a.offset / 4))
+                } else {
+                    None
+                };
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
+                    match (k, nonempty) {
+                        (0, _) => self.write(inst, reg, lo, None),
+                        (1, _) => self.write(inst, reg, hi, None),
+                        (2, Some(value)) => self.write(inst, reg, value, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
@@ -11095,6 +11129,28 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    #[test]
+    fn buffer_extent_queries_only_replace_exact_zero_tests() {
+        let check = |comparison| {
+            let code = [
+                0xBE84_0300, 0xBE85_0380, // table pointer in s[4:5]
+                0xF408_0202, 0xFA00_0000, // buffer descriptor in s[8:11]
+                comparison,              // compare NUM_RECORDS in s10
+                0xBF85_0003,             // if true skip the LDS write
+                0x7E00_0280,             // v0 = 0
+                0xD834_0000, 0,          // ds_write_b32 v0, v0
+                S_ENDPGM,
+            ];
+            lower_with(&code, vec![root(RootType::Table, 0, 0)], vec![UsedResource {
+                kind: ResourceType::Srv, root: RootType::Table, table_offset_dwords: 0,
+                lower_bound: 0, stride: 16, dwords: 4, user_data: 0, slot: 0,
+            }])
+        };
+        assert!(check(0xBF06_800A).is_ok()); // equal to zero
+        assert!(check(0xBF07_800A).is_ok()); // unequal to zero
+        assert!(check(0xBF06_870A).is_err()); // literal seven requires the count
     }
 
     #[test]
