@@ -479,3 +479,61 @@ draws 的曲线：11-15 持续到 16:54:22，然后 16:54:54 一跳 **1571 → 7
 | | `VICTORY_LEVELS_ON_DEMAND` |
 
 那 8 个要在 2222.rar 那个分支里才有（`queue2.rs` 1047 行双 copy queue、`drvwatch.rs`、`cardmeter.rs`）。
+
+## 二十、把 PR #798 的 patch 机制和 watchdog 都搬过来
+
+`line/main` 上加了两个东西，都不是直接 apply 的补丁，是手动移植的：
+
+**一、`CodePatch` 机制**（PR #798 的核心）
+- `crates/victory-game/src/lib.rs`：`KnownBuild` 加 `patches: &'static [CodePatch]` 字段，
+  `CodePatch { name, rva, expect, write }`，两个 upscaler 选择函数都写 `b8 06 00 00 00 c3`
+  （`mov eax, 6; ret`）
+- `crates/victory-loader/src/prepare.rs`：`PreparedImage` 加 `patched: Option<blake3::Hash>`，
+  `file_name()` 加 `-p<8 hex>` 后缀，新增 `fn patch(&mut self, patches)` —— **先校验期望字节再写**
+- `apps/victory/src/run.rs`：`apply_title_patches()` + `VICTORY_TITLE_PATCHES=0` 关掉 +
+  `VICTORY_TITLE_PATCH=<rva>:<old>:<new>` 手动加
+
+实测两个站点都命中：
+
+```
+title patch    +0x7e93f0 upscaler choice: 4883ec28803d -> b806000000c3
+title patch    +0x5400190 upscaler choice (the per-frame copy): 4883ec28488b -> b806000000c3
+```
+
+**二、watchdog 补丁**（从 `victory-1k` 搬的，51 行 + 调用点）
+- `+0x2215c27`：`mov rax,[handler]; test/jz; call rax` → `jmp +0x18`
+- `+0x23cf683`：`mov dword ptr [0], imm32` → 11 个 NOP
+
+实测 `title watchdog hooks (VICTORY_NO_WATCHDOG) applied=2`。
+
+**为什么重要**：上一轮（没 watchdog）四次「崩溃」里至少一次是它自己开火
+（`+0x23cf683 (write 0x0)`），是主线程 31 秒没推进触发的自杀，不是渲染崩。
+补上之后这轮零崩溃。
+
+## 二十一、Series S 档卡在 8 draws
+
+`--console series-s` 加上 upscaler 补丁：patch 命中、`being made` 从 640 排到 4（四分钟，
+比 Series X 快一倍），但 **draws 一直 8**，30 fps 稳了九分钟不动。
+
+Series S 的 `title_memory` 只有 7776 MiB（`console.rs` 里写死的），比 Series X 的
+`(10 GiB, 3.5 GiB)` 小，所以它拿到的资源少，进不了世界。PR #798 作者在 RTX 3090 Ti 上
+Series S 是 6.1-6.4 fps，我们这边连世界都进不去 —— 显存等级不同。
+
+**结论**：Series S 这条路在这台 8 GB 卡上不通，用 Series X 档。
+
+## 二十二、最终状态
+
+`line/main` = 作者主线（PR #2 + #3 + 208 个） + PR #798 的 patch 机制 + watchdog 补丁 +
+四个开关（`INDIRECT_WINDOW` / `TEXTURE_NO_WAIT` / `SHADER_LOOP_LIMIT=1024` / `TEXTURE_ROOM_PERCENT=82`）。
+
+**实测**：
+- `being made` 1404 → 4（六分钟）
+- draws 12 → 3376 → 6642，**峰值 6777**（另一轮 10537）
+- **零崩溃**
+- 帧时间 2743-15552 ms（0.1-0.4 fps）
+- `copies` 到 4775 ms / 129 MB，`texturing` 644 ms / 18 MB，回读 5105 ms / 57 MB
+
+**还差**：那 4000+ 个 draw 的场景在 8 GB 卡上有 6.2/6.8 GB 的显存压力，
+`copies` 和回读各占几秒，帧时间还得往下压。
+
+日志：`docs/run-xss-breakthrough.log`（10537 那轮）、`docs/run-final-patched.log`（零崩溃这轮）

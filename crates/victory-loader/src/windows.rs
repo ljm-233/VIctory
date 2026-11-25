@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
@@ -83,6 +83,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        let applied = patch_watchdog(loaded.base());
+        if applied > 0 {
+            tracing::info!(applied, "title watchdog hooks (VICTORY_NO_WATCHDOG)");
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -457,4 +461,69 @@ impl LoadedImage {
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
     }
+}
+
+/// The title ends its own process when its main thread has not advanced for
+/// about thirty one-second ticks. On a host that loads the world far slower
+/// than the console that is a slow load, not a dead title, and the way out is
+/// the title's own fault: its watchdog handler writes to address 0, first at
+/// `+0x23cf683` inside the handler and again at `+0x2215c35` right after the
+/// `call rax` that reaches it.
+///
+/// With `VICTORY_NO_WATCHDOG` set, step over the call (a short jump to the
+/// loop's continuation) and turn the handler's fault into NOPs, so the title
+/// keeps waiting instead of exiting. Both sites are the 1.0.2.1 build only,
+/// and each is patched only when the bytes there are the ones expected.
+/// Returns how many sites were patched; 0 when the variable is unset or the
+/// image is another build.
+fn patch_watchdog(base: usize) -> usize {
+    let base = base as *mut u8;
+    if std::env::var_os("VICTORY_NO_WATCHDOG").is_none() {
+        return 0;
+    }
+    // (offset, bytes at the site now, bytes to write)
+    const SITES: [(usize, &[u8], &[u8]); 2] = [
+        // mov rax, [handler]; test/jz; call rax -> jmp +0x18 past all of it.
+        (0x2215c27, &[0x48, 0x8b, 0x05], &[0xeb, 0x18]),
+        // c7 04 25 00 00 00 00 <imm32> (mov dword ptr [0], imm32) -> NOPs.
+        (
+            0x23cf683,
+            &[0xc7, 0x04, 0x25, 0x00],
+            &[0x90; 11],
+        ),
+    ];
+    let mut applied = 0usize;
+    for (offset, expect, write) in SITES {
+        // SAFETY: the image is mapped and no title code has run yet.
+        let site = unsafe { base.add(offset) };
+        // SAFETY: `expect.len()` bytes of the mapped image, read only.
+        let current = unsafe { std::slice::from_raw_parts(site, expect.len()) };
+        if current != expect {
+            tracing::warn!(
+                offset = format_args!("{offset:#x}"),
+                bytes = %current.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+                "title watchdog site does not hold the expected bytes; left alone"
+            );
+            continue;
+        }
+        let mut old = 0u32;
+        // SAFETY: a site inside our own mapped image.
+        if unsafe {
+            VirtualProtect(
+                site.cast(),
+                write.len(),
+                PAGE_EXECUTE_READWRITE,
+                &mut old,
+            )
+        } == 0
+        {
+            continue;
+        }
+        // SAFETY: the page is writable, and `write` fits the site we checked.
+        unsafe { std::ptr::copy_nonoverlapping(write.as_ptr(), site, write.len()) };
+        // SAFETY: put the page's protection back.
+        unsafe { VirtualProtect(site.cast(), write.len(), old, &mut old) };
+        applied += 1;
+    }
+    applied
 }
