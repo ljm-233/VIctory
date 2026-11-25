@@ -7,13 +7,11 @@ using System.Runtime.InteropServices;
 namespace Victory {
  public static class ClientArea {
   [StructLayout(LayoutKind.Sequential)] struct Rect { public int Left,Top,Right,Bottom; }
-  [StructLayout(LayoutKind.Sequential)] struct MonitorInfo { public int Size; public Rect Desktop,Work; public int Flags; }
   [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
   [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h,out Rect rect);
   [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h,out Rect rect);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint id);
-  [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h,uint flags);
-  [DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr m,ref MonitorInfo info);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h,int attribute,out Rect rect,int size);
   [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h,IntPtr z,int x,int y,int w,int height,uint flags);
   [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
   [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr h,int cmd);
@@ -25,14 +23,13 @@ namespace Victory {
       if(IsZoomed(h)) {ShowWindowAsync(h,9);return null;}
       Rect c,w;
       if(!GetClientRect(h,out c)||!GetWindowRect(h,out w))return null;
-      if(c.Right==1920 && c.Bottom==1080)return "1920x1080";
+      // The outer Win32 rectangle includes an invisible resizing margin.
+      Rect visible;
+      if(DwmGetWindowAttribute(h,9,out visible,Marshal.SizeOf(typeof(Rect)))!=0) visible=w;
+      if(c.Right==1920 && c.Bottom==1080 && visible.Left==0 && visible.Top==0)
+        return "1920x1080, visible top-left (0,0)";
       int width=1920+w.Right-w.Left-c.Right, height=1080+w.Bottom-w.Top-c.Bottom;
-      var mon=new MonitorInfo();mon.Size=Marshal.SizeOf(typeof(MonitorInfo));
-      int x=w.Left,y=w.Top;
-      if(GetMonitorInfoW(MonitorFromWindow(h,2),ref mon)){
-        x=mon.Work.Left+Math.Max(0,(mon.Work.Right-mon.Work.Left-width)/2);
-        y=mon.Work.Top+Math.Max(0,(mon.Work.Bottom-mon.Work.Top-height)/2);
-      }
+      int x=w.Left-visible.Left, y=w.Top-visible.Top;
       SetWindowPos(h,IntPtr.Zero,x,y,width,height,0x4014);
       return null;
     } finally {if(previous!=IntPtr.Zero) SetThreadDpiAwarenessContext(previous);}
@@ -51,4 +48,4 @@ while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
     }
     Start-Sleep -Milliseconds 250
 }
-throw "No 1920x1080 game window confirmed within $TimeoutSeconds seconds (PID $GameProcessId)."
+throw "Game window did not reach 1920x1080 at (0,0) within $TimeoutSeconds seconds (PID $GameProcessId)."

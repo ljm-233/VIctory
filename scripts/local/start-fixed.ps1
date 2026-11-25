@@ -112,4 +112,4 @@ $marker=if ($Combined) { 'last-combined-run.txt' } elseif ($Ztrx) { 'last-ztrx93
 Set-Content -LiteralPath (Join-Path $RuntimeRoot $marker) -Value $run
 Write-Output ("PID {0} | {1}" -f $proc.Id,$run)
 
-if ($Combined) { & (Join-Path $PSScriptRoot 'set-game-window.ps1') -GameProcessId $proc.Id }
+& (Join-Path $PSScriptRoot 'set-game-window.ps1') -GameProcessId $proc.Id
