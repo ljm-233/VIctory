@@ -3059,6 +3059,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
+        check_texture_copy(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_and_overlapping_texture_copies_preserve_texels() {
+        check_texture_copy(true);
+    }
+
+    #[cfg(windows)]
+    fn check_texture_copy(move_region: bool) {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -3161,6 +3172,14 @@ mod tests {
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
+        if move_region {
+            let same_resource: extern "system" fn(This, This, This) = slot(list, 0x88);
+            same_resource(list, image, image);
+            let region = [0_u32, 1, 0, 2, 2, 1];
+            let copy: Copy = slot(list, 0x80);
+            copy(list, &to, 0, 1, 0, &to, region.as_ptr().cast());
+            copy(list, &to, 1, 1, 0, &to, region.as_ptr().cast());
+        }
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
@@ -3248,7 +3267,14 @@ mod tests {
         };
         for row in 0..4 {
             let at = row * 256;
-            assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
+            let mut expected = bytes[at..at + 16].to_vec();
+            if row == 1 && move_region {
+                expected.copy_within(0..8, 4);
+            }
+            assert_eq!(read[at..at + 16], expected, "row {row}");
+        }
+        if move_region {
+            eprintln!("GPU readback verified all 16 RGBA texels after identity and overlapping copies");
         }
     }
 

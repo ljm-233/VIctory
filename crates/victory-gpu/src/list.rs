@@ -871,9 +871,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // A destination made level by level gets its levels' memory
             // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
+            crate::texture::host_written(dst);
+            if windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) {
+                note_identity_copy();
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -901,6 +905,46 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+#[cfg(windows)]
+fn note_identity_copy() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    let count = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::info!(count, "skipped identity copies of a host texture");
+    }
+}
+
+/// Preserve the source before a region is moved within an aliased host texture.
+/// HostList tracks states per resource, including textures with several mips.
+#[cfg(windows)]
+fn snapshot_copy_source(
+    list: &crate::host::HostList,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    source: CopyLocation,
+) -> windows::core::Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    // SAFETY: the source is live, and both locations use the same native subresource layout.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        texture.GetDevice(&mut device)?;
+        let device = device.ok_or(windows::core::Error::from(windows::Win32::Foundation::E_POINTER))?;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut desc = texture.GetDesc();
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Alignment = 0;
+        let mut scratch: Option<ID3D12Resource> = None;
+        device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut scratch)?;
+        let scratch = scratch.ok_or(windows::core::Error::from(windows::Win32::Foundation::E_POINTER))?;
+        let dest = CopyLocation { resource: scratch.as_raw().cast(), ..source };
+        list.keep(&scratch);
+        list.list.CopyTextureRegion((&raw const dest).cast(), 0, 0, 0, (&raw const source).cast(), None);
+        list.list.ResourceBarrier(&[crate::host::transition(&scratch, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        Ok(scratch)
+    }
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -966,6 +1010,7 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        let mut aliased = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -998,7 +1043,10 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            aliased = src.kind == 0 && dst.kind == 0 && texture.as_raw() == to.as_raw();
+            if !aliased {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
@@ -1009,8 +1057,25 @@ extern "system" fn copy_texture_region(
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
-        ensure_state(list, dst.resource, COPY_DEST);
+        if aliased {
+            // SAFETY: a supplied source box is the same six coordinates passed to D3D12 below.
+            let origin = unsafe { source_box.as_ref() }.map_or([0; 3], |b| [b[0], b[1], b[2]]);
+            if src.footprint.offset as u32 == dst.footprint.offset as u32 && origin == [x, y, z] {
+                crate::texture::host_written(dst.resource);
+                note_identity_copy();
+                return;
+            }
+            ensure_state(list, src.resource, COPY_SOURCE);
+            match snapshot_copy_source(list, to, from) {
+                Ok(scratch) => from.resource = scratch.as_raw().cast_const().cast(),
+                Err(error) => {
+                    tracing::warn!(%error, "could not preserve the source of an aliased texture copy");
+                    return;
+                }
+            }
+        }
         crate::texture::host_written(dst.resource);
+        ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
