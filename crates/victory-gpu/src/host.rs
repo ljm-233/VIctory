@@ -6685,7 +6685,8 @@ mod page_ask_tests {
         // What is there is copied; what is not is zeros.
         let mut checked = 0;
         for (i, byte) in dst.iter().enumerate() {
-            let hole = (i >= 2 << 20 && i < (2 << 20) + K64) || (i >= (5 << 20) + 3 * PAGE && i < (5 << 20) + 3 * PAGE + K64);
+            let hole = ((2 << 20)..((2 << 20) + K64)).contains(&i)
+                || (((5 << 20) + 3 * PAGE)..((5 << 20) + 3 * PAGE + K64)).contains(&i);
             if hole {
                 assert_eq!(*byte, 0, "byte {i:#x} is in a hole");
             } else {

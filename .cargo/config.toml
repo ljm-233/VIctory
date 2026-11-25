@@ -1,12 +1,2 @@
-[alias]
+﻿[alias]
 xtask = "run --quiet --package xtask --"
-
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "/mnt/winbot-software/GTA6/vendor"
-
-[target.x86_64-pc-windows-gnu]
-linker = "/home/link/toolchain-dl/mingw/usr/bin/x86_64-w64-mingw32-gcc"
-ar = "/home/link/toolchain-dl/mingw/usr/bin/x86_64-w64-mingw32-ar"

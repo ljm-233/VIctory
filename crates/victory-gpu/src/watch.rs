@@ -512,7 +512,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = j.as_mut().expect("made on first use");
     // What the map holds, sampled where its lock is taken anyway: a take per
     // 256 is nothing, and the frame line says whether its size is the cost.
-    if JOURNAL_SIZE[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0 {
+    if JOURNAL_SIZE[3]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(256)
+    {
         use std::sync::atomic::Ordering::Relaxed;
         JOURNAL_SIZE[0].store(j.written.len() as u64, Relaxed);
         JOURNAL_SIZE[1].store(j.written.capacity() as u64, Relaxed);

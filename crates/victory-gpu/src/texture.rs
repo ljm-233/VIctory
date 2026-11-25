@@ -1175,7 +1175,13 @@ fn one_run(
     f: &mut impl FnMut(usize, usize, usize, bool) -> bool,
 ) -> bool {
     const KERNEL_PAGE: usize = 4096;
-    let (start, stop) = ((from * KERNEL_PAGE).max(at), (to * KERNEL_PAGE).min(end));
+    // Saturating: a walk of `[at, at + len)` whose last page is the kernel's
+    // top one (the title's pools are at the end of its address space) would
+    // otherwise multiply past the word's end.
+    let (start, stop) = (
+        from.saturating_mul(KERNEL_PAGE).max(at),
+        to.saturating_mul(KERNEL_PAGE).min(end),
+    );
     if start >= stop {
         return true;
     }
