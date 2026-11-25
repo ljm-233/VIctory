@@ -428,7 +428,6 @@ pub(crate) fn writes_since(
         failed as u64,
     );
     let kind = if failed {
-        count = 0;
         if !guarded || prefer_guarded {
             return None;
         }
