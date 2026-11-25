@@ -1872,8 +1872,10 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes. The
+    /// boolean is true when the list recorded a `CopyTextureRegion` reading
+    /// that staging buffer on the GPU.
+    Texture(std::sync::Arc<crate::texture::Staging>, bool),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2579,7 +2581,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -3464,6 +3466,103 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    /// A texture staging buffer marked in flight only triggers `wait_flight`
+    /// when a refresh actually detiles new contents (never on unchanged
+    /// refreshes), and skipped uploads record `uploads = false`.
+    #[test]
+    fn staging_wait_only_runs_on_detile_and_real_uploads() {
+        let Some(host) = super::host() else { return };
+        let heap_words: [u32; 5] = [1, 0, 0, 1, 1];
+        let desc_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 28, 1, 0, 256, 0, 0];
+        // SAFETY: plain repr(C) structs matching D3D12 layouts.
+        let (heap, desc) = unsafe {
+            (
+                std::mem::transmute::<[u32; 5], crate::resource::HeapProperties>(heap_words),
+                std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(desc_words),
+            )
+        };
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                &heap,
+                0,
+                &desc,
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut resource,
+            ),
+            crate::object::S_OK
+        );
+        let (mem, _) = crate::resource::texture_memory(resource).expect("texture memory");
+        // SAFETY: committed title texture memory (at least 4*16*4 bytes).
+        unsafe { std::ptr::write_bytes(mem as *mut u8, 0x11, 256) };
+        let tex = crate::resource::host_resource(resource).expect("host texture");
+        let list1 = host.new_list().expect("host list 1");
+        crate::texture::upload(&list1, resource, tex);
+        let (staging, uploads1) = list1
+            .deferred()
+            .copies
+            .iter()
+            .find_map(|step| match step {
+                super::Step::Texture(s, u) => Some((s.clone(), *u)),
+                _ => None,
+            })
+            .expect("texture step on first upload");
+        assert!(uploads1, "first upload must record CopyTextureRegion");
+        // Initial refresh detiles (leaving dirty=true after defer_host ran first).
+        let mut waited = Vec::new();
+        let mut batch = super::Batch::default();
+        list1.run_deferred(&mut batch, &mut |need| waited.push(need));
+        assert!(waited.is_empty(), "no flight in progress yet");
+        // Second list runs with unchanged memory so defer_host clears dirty=false
+        // and refresh does not detile.
+        let list2 = host.new_list().expect("host list 2");
+        crate::texture::upload(&list2, resource, tex);
+        let mut batch2 = super::Batch::default();
+        list2.run_deferred(&mut batch2, &mut |need| waited.push(need));
+        assert!(waited.is_empty());
+        // Mark staging in flight for submission 10.
+        staging.mark_in_flight(10);
+        // Third upload skips CopyTextureRegion (uploaded && !dirty) -> uploads=false.
+        let list3 = host.new_list().expect("host list 3");
+        crate::texture::upload(&list3, resource, tex);
+        let uploads3 = list3
+            .deferred()
+            .copies
+            .iter()
+            .find_map(|step| match step {
+                super::Step::Texture(_, u) => Some(*u),
+                _ => None,
+            })
+            .expect("texture step on third upload");
+        assert!(!uploads3, "clean texture must skip CopyTextureRegion");
+        // Unchanged refresh must NOT wait even though in_flight == 10.
+        staging.refresh(&mut |need| waited.push(need));
+        assert!(waited.is_empty(), "unchanged refresh must not wait: {waited:?}");
+        // Mutating title memory triggers detile, which MUST wait for submission 10.
+        unsafe { std::ptr::write_bytes(mem as *mut u8, 0x22, 256) };
+        staging.refresh(&mut |need| waited.push(need));
+        assert_eq!(waited, vec![10], "detile must wait for in-flight submission 10");
+        list1.close();
+        list2.close();
+        list3.close();
+        drop(list1);
+        drop(list2);
+        drop(list3);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+            resource, 0x10,
+        );
+        assert_eq!(release(resource), 0);
     }
 }
 
@@ -5382,8 +5481,19 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        let mut wait_flight = |need: u64| {
+            if late && need > FINISHED.load(Ordering::Acquire) {
+                let settling = std::time::Instant::now();
+                if relay_exact() {
+                    relay_wait(WHY_READ, |_| need <= FINISHED.load(Ordering::Acquire));
+                } else {
+                    self.settle(&mut submitted, WHY_READ);
+                }
+                settled += settling.elapsed();
+            }
+        };
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, &mut wait_flight);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -5417,6 +5527,13 @@ impl Host {
         }
         let prepared = std::time::Instant::now();
         if late {
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Texture(staging, true) = step {
+                        staging.mark_in_flight(this_submission);
+                    }
+                }
+            }
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -6647,15 +6764,22 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// submitted, keeping it alive until the list is reset. `uploads` is
+    /// true when this list recorded a `CopyTextureRegion` reading `staging`.
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        uploads: bool,
+    ) {
+        self.deferred().copies.push(Step::Texture(staging, uploads));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// lists of a submission, through many ranges). `wait_flight` is called
+    /// before detiling into a texture staging buffer that an unfinished
+    /// submission may still be reading on the GPU.
+    fn run_deferred(&self, batch: &mut Batch, wait_flight: &mut dyn FnMut(u64)) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -6728,9 +6852,9 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        staging.refresh(wait_flight);
                     }
                     continue;
                 }
