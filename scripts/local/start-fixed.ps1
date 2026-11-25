@@ -1,6 +1,7 @@
 ﻿param([string]$RuntimeRoot, [string]$StorySeed, [string]$GameDirectory, [switch]$WaterFix, [switch]$DefaultBufferBudget, [switch]$CheckOnly,
-    [switch]$Ztrx, [switch]$Combined, [switch]$ManualPlay, [ValidateSet('Sync','Relay2','Late3','AsyncRelay2')][string]$Schedule='Sync')
+    [switch]$Ztrx, [switch]$Combined, [switch]$TextureQueue, [switch]$ManualPlay, [ValidateSet('Sync','Relay2','Late3','AsyncRelay2')][string]$Schedule='Sync')
 $ErrorActionPreference='Stop'
+if ($TextureQueue) { $Combined=$true }
 if ($Combined -and $Ztrx) { throw 'Choose one build: Combined or Ztrx.' }
 if ($Schedule -eq 'AsyncRelay2' -and -not $Combined) { throw 'AsyncRelay2 requires -Combined.' }
 if ($Ztrx -or $Combined) { $WaterFix=$true }
@@ -27,7 +28,7 @@ if (-not $StorySeed) {
 if(-not $GameDirectory) { $GameDirectory=Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'GTA6.Xbox.v1.0.2.1-CYBERLEEK' }
 if(-not (Test-Path -LiteralPath (Join-Path $GameDirectory 'game_scarlett_master.exe'))) { throw "Game executable missing at $GameDirectory" }
 if(-not (Test-Path -LiteralPath (Join-Path $StorySeed '7952987A'))) { throw "Story seed missing at $StorySeed" }
-$binary=if ($Combined) { 'victory-scene-combined.exe' } elseif ($Ztrx) { 'victory-scene-ztrx.exe' } elseif ($WaterFix) { 'victory-scene-water.exe' } else { 'victory-scene-fixed.exe' }
+$binary=if ($TextureQueue) { 'victory-scene-texture-queue.exe' } elseif ($Combined) { 'victory-scene-combined.exe' } elseif ($Ztrx) { 'victory-scene-ztrx.exe' } elseif ($WaterFix) { 'victory-scene-water.exe' } else { 'victory-scene-fixed.exe' }
 $exe=Join-Path $PSScriptRoot $binary
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Missing executable: $exe" }
 if (-not $ManualPlay -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'geometry-packs.index') -PathType Leaf)) { throw 'Missing geometry index' }
@@ -53,14 +54,14 @@ if ($CheckOnly) {
     [pscustomobject]@{Executable=$exe;Seed=$StorySeed;Cache=(Join-Path $RuntimeRoot 'cache');ForceMute=$env:VICTORY_FORCE_MUTE;ManualPlay=[bool]$ManualPlay;Schedule=$Schedule;AsyncSubmit=$env:VICTORY_ASYNC_SUBMIT;CopyQueue=$env:VICTORY_QUEUE2;Relay=$env:VICTORY_RELAY;LateWait=$env:VICTORY_LATE_WAIT;WideBack=$env:VICTORY_WIDE_BACK;BufferThresholdMiB=$env:VICTORY_CARD_BUFFERS_MIN_MB;BufferBudgetMiB=$env:VICTORY_CARD_BUFFERS_MB}
     return
 }
-$knownNames=@('victory-room-trace','victory-fx-local','victory-geometry-trace','victory-model-samples','victory-scene-fixed','victory-scene-water','victory-scene-ztrx','victory-scene-combined')
+$knownNames=@('victory-room-trace','victory-fx-local','victory-geometry-trace','victory-model-samples','victory-scene-fixed','victory-scene-water','victory-scene-ztrx','victory-scene-combined','victory-scene-texture-queue')
 $editions=(Split-Path -Parent $PSScriptRoot) + [IO.Path]::DirectorySeparatorChar
 foreach($proc in @(Get-Process -Name $knownNames -ErrorAction SilentlyContinue)) {
     if ($proc.Path -and $proc.Path.StartsWith($editions, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Game is already running (PID $($proc.Id))."
     }
 }
-$tag=if ($Combined) { "combined-f85101b-$Schedule-" } elseif ($Ztrx) { "ztrx93-$Schedule-" } elseif ($ManualPlay) { "manual-$Schedule-" } elseif ($WaterFix) { 'water-4e17478-' } else { 'fixed-4e17478-' }
+$tag=if ($TextureQueue) { "combined-queue-$Schedule-" } elseif ($Combined) { "combined-f85101b-$Schedule-" } elseif ($Ztrx) { "ztrx93-$Schedule-" } elseif ($ManualPlay) { "manual-$Schedule-" } elseif ($WaterFix) { 'water-4e17478-' } else { 'fixed-4e17478-' }
 $run=Join-Path $RuntimeRoot ('runs\'+$tag+(Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 New-Item -ItemType Directory -Path $run -ErrorAction Stop | Out-Null
 if (-not $ManualPlay) {
