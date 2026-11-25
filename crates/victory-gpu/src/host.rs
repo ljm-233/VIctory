@@ -8,6 +8,9 @@
 #[cfg(feature = "diagnostics")]
 #[path = "model_coverage.rs"]
 mod coverage;
+#[cfg(feature = "diagnostics")]
+#[path = "water_readback.rs"]
+pub(crate) mod water_readback;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -1905,6 +1908,10 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    back_wanted: Vec<crate::texback::Pending>,
+    texture_backs: Vec<crate::texback::Back>,
+    #[cfg(feature = "diagnostics")]
+    water_probes: Vec<water_readback::Probe>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3763,6 +3770,9 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -3790,6 +3800,10 @@ fn read_backs(list: &HostList) {
                 buffer.Unmap(0, None);
             }
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    for probe in &list.deferred().water_probes {
+        probe.report();
     }
 }
 
@@ -6081,6 +6095,13 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        let pending = std::mem::take(&mut self.deferred().back_wanted);
+        for source in pending {
+            self.settle(&source.copy, 0x800); // COPY_SOURCE
+            if let Some(back) = crate::texback::record(&self.list, source) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
@@ -6273,6 +6294,55 @@ impl HostList {
         true
     }
 
+    /// Before a draw or dispatch binds anything: every depth texture with a
+    /// stencil plane whose depth plane's twin an earlier draw or dispatch of
+    /// this list wrote (the tiled lighting's compute writes each pixel's
+    /// material class there) gets the stencil twin copied and the depth
+    /// plane's twin drawn into the plane now, not when the list closes.
+    /// That shortcut of `twin_use` left the shaders that read the classes
+    /// back in the same list (as a texture: run pn1 saw no such depth
+    /// target) with the classes of the frame before, about once a frame.
+    /// Done for whatever comes next, also a dispatch that writes the twin
+    /// again (a pass more, never a wrong one): which textures a draw reads
+    /// is known only while its tables are made, after its pipeline is set.
+    /// True if a pass was recorded: it set a descriptor heap, graphics root
+    /// signature, pipeline, depth target, viewport, scissor and topology of
+    /// its own, and the caller sets the title's again
+    /// (`State::after_our_pass`). `VICTORY_PLANE_NOW=0` keeps the old way.
+    pub(crate) fn planes_now(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_NOW").is_none_or(|v| v != "0")) {
+            return false;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.is_empty() {
+            return false;
+        }
+        let due: Vec<_> = twins
+            .values_mut()
+            .filter(|u| u.behind[0] == Some(true) && u.twin.plane.is_some())
+            .map(|u| {
+                u.behind[0] = Some(false);
+                u.late = false;
+                (u.depth.clone(), u.twin.clone())
+            })
+            .collect();
+        drop(twins);
+        for (depth, twin) in &due {
+            self.twin_copy(depth, twin, false);
+            self.pass_plane(depth, twin);
+            // Indexed SRVs may read this plane without naming it in twin_use.
+            self.settle(depth, 0x40 | 0x80); // non-pixel and pixel shader resource
+        }
+        if !due.is_empty() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!("depth planes written by shaders are drawn into the plane before the next draw or dispatch, not when the list closes (VICTORY_PLANE_NOW=0: as before)");
+            });
+        }
+        !due.is_empty()
+    }
+
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
     /// pass needs; the twin is left in the unordered access state. Only
@@ -6346,6 +6416,14 @@ impl HostList {
             // leave its own pipeline and target set.
             self.pass_plane(depth, twin);
             self.settle(depth, SHADER_RESOURCE);
+        }
+    }
+
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) { return; }
+        if self.deferred().back_wanted.iter().any(|p| p.matches(resource)) { return; }
+        if let Some(pending) = crate::texback::Pending::new(resource) {
+            self.deferred().back_wanted.push(pending);
         }
     }
 
@@ -6515,7 +6593,8 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.texture_backs.is_empty())
             {
                 return false;
             }
@@ -7263,6 +7342,14 @@ unsafe extern "system" {
         size: usize,
         written: *mut usize,
     ) -> i32;
+}
+
+pub(crate) fn write_texture_back(at: usize, bytes: &[u8]) -> bool {
+    let mut done = 0;
+    // SAFETY: bounded source; the kernel validates the destination. The caller
+    // holds the mapping read guard and the destination ticket until return.
+    unsafe { NtWriteVirtualMemory(windows_sys::Win32::System::Threading::GetCurrentProcess(),
+        at as _, bytes.as_ptr().cast(), bytes.len(), &mut done) >= 0 && done == bytes.len() }
 }
 
 /// Whether title memory is written with the kernel's own call

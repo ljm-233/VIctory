@@ -693,6 +693,35 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// A pass of ours was recorded into the title's list
+    /// (`HostList::plane_now`): it set a descriptor heap, a graphics root
+    /// signature, a pipeline, a depth target, a viewport, a scissor and the
+    /// topology. What the title set is set again: targets, viewports,
+    /// scissors and topology here; heaps, root signatures and pipeline by
+    /// the next `bind`, told that the list holds none of the title's (heaps
+    /// as no title's set, so the title's go back even if it set none). The
+    /// tables stay: they are in this host list. The pass leaves the blend
+    /// factor, stencil reference and depth bounds alone.
+    fn after_our_pass(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        if self.targets_set {
+            let handles = std::mem::take(&mut self.target_handles);
+            self.set_targets(list, &handles, self.depth_handle);
+        }
+        if !self.viewports.is_empty() {
+            crate::draw::viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            let rects = std::mem::take(&mut self.scissors);
+            self.set_scissors(list, &rects);
+        }
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -946,6 +975,12 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Depth planes this list's shaders wrote (the material classes):
+        // drawn into their planes by a pass of ours before anything of the
+        // title's is set, so what reads them next finds them.
+        if list.planes_now() {
+            self.after_our_pass(list);
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -2080,7 +2115,30 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        self.trace_water(list, p, Some([x, y, z]));
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn trace_water(&self, list: &HostList, p: &HostPipeline, groups: Option<[u32; 3]>) {
+        use crate::host::water_readback as water;
+        if !water::enabled() { return; }
+        let Some(stage) = p.stages.iter().find(|s| s.shader.hash == water::HEIGHT_LOOKUP) else { return };
+        let frame = crate::queue::presented() + 1;
+        if !water::sample_frame(frame) { return; }
+        // Resolve the actual table and view for u11, including subviews.
+        let resources = &stage.translated().used;
+        let view = resources.iter().find(|u| u.root == RootType::Table
+            && u.kind == ResourceType::Uav && u.lower_bound == 11).and_then(|u| {
+            let Root::Table(base) = self.roots_ref(true).get(usize::from(u.slot))? else {return None};
+            crate::descriptor::view(base.checked_add(u64::from(u.table_offset_dwords) * 4)?)
+        });
+        if let Some((shadow, address, bytes)) = view.as_ref().and_then(crate::descriptor::host::buffer_copy) {
+            water::record(list, &shadow, address, bytes, frame, groups);
+        } else {
+            tracing::info!(frame, ?groups, ?resources, "water lookup dispatched without a resolved u11 buffer");
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3085,6 +3143,10 @@ impl State {
         };
         #[cfg(feature = "diagnostics")]
         drop(sample);
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.trace_water(list, p, None);
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -3239,6 +3301,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

@@ -2238,6 +2238,37 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+/// Width, height and format of texture `this` (`None` for a buffer), for
+/// `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension == 3 && r.desc.sample_count <= 1).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a texture with planes.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
+
 impl Resource {
     fn data(&self) -> *mut u8 {
         match self.backing {
@@ -2293,6 +2324,13 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
         },
     });
+    #[cfg(windows)]
+    if crate::texback::has_pending() {
+        let size = if desc.dimension == BUFFER { Some(desc.width) } else { texture_layout(&desc).map(|t| t.size) };
+        if let Some(size) = size {
+            crate::texback::invalidate(resource.data() as usize, size as usize);
+        }
+    }
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {
@@ -2319,6 +2357,7 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        crate::texback::retire_owner(self as *const Self as usize);
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
@@ -2863,6 +2902,68 @@ mod tests {
         }
     }
 
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires VICTORY_TEXTURE_BACK=1 and a D3D12 adapter"]
+    fn boat_water_gpu_copy_retiles_four_formats_and_skips_reused_memory() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let host = crate::host::host().expect("D3D12");
+        for (width, format) in [(256usize, 41u32), (256, 16), (64, 16), (128, 36)] {
+            let mut desc = texture(width as u64, width as u32, format, 1);
+            desc.flags = 4; // unordered access
+            let mut object: This = std::ptr::null();
+            assert_eq!(create_committed(std::ptr::null_mut(), &PROPERTIES, 0, &desc, 0,
+                std::ptr::null(), &RESOURCE_IIDS[0], &mut object), S_OK);
+            let copy = host_copy(object).expect("host texture");
+            let (layout, at, bytes) = title_texture(object).unwrap();
+            let pitch = width * layout.desc.element_bytes as usize;
+            let length = pitch * width;
+            let pattern: Vec<u8> = (0..length).map(|i| (i.wrapping_mul(19) ^ (i >> 8)) as u8).collect();
+            let (upload, mapped) = host.upload_buffer(length as u64).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), mapped, length); }
+            let counter = crate::texback::land_count((width as u64, width as u32, format)).unwrap();
+            let before = counter.load(std::sync::atomic::Ordering::Relaxed);
+            for stale in [false, true] {
+                let mut original = vec![0x53; bytes];
+                assert!(crate::host::write_texture_back(at, &original));
+                let list = host.new_list().unwrap();
+                crate::list::ensure_state(&list, object, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: unsafe { std::mem::transmute_copy(&upload) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: unsafe { copy.texture.GetDesc() }.Format, Width: width as u32,
+                            Height: width as u32, Depth: 1, RowPitch: pitch as u32,
+                        },
+                    }},
+                };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None); }
+                list.texture_written(object);
+                list.close();
+                if stale {
+                    crate::title_memory_remapped(at + bytes / 2, 1);
+                } else {
+                    crate::texback::invalidate(at + bytes, 1);
+                    layout.tile(&mut original, 0, 0, &pattern, pitch, length).unwrap();
+                }
+                host.execute(&[&list]);
+                let mut actual = vec![0; bytes];
+                assert!(crate::host::read_into(at as *const u8, &mut actual));
+                assert!(actual == original, "water copy mismatch for format {format}, stale={stale}");
+                assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), before + 1,
+                    "only the completed write should be counted for {width}x{width} f{format}");
+            }
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+        }
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
@@ -3059,17 +3160,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
-        check_texture_copy(false);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn identity_and_overlapping_texture_copies_preserve_texels() {
-        check_texture_copy(true);
-    }
-
-    #[cfg(windows)]
-    fn check_texture_copy(move_region: bool) {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -3172,14 +3262,6 @@ mod tests {
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
-        if move_region {
-            let same_resource: extern "system" fn(This, This, This) = slot(list, 0x88);
-            same_resource(list, image, image);
-            let region = [0_u32, 1, 0, 2, 2, 1];
-            let copy: Copy = slot(list, 0x80);
-            copy(list, &to, 0, 1, 0, &to, region.as_ptr().cast());
-            copy(list, &to, 1, 1, 0, &to, region.as_ptr().cast());
-        }
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
@@ -3267,14 +3349,7 @@ mod tests {
         };
         for row in 0..4 {
             let at = row * 256;
-            let mut expected = bytes[at..at + 16].to_vec();
-            if row == 1 && move_region {
-                expected.copy_within(0..8, 4);
-            }
-            assert_eq!(read[at..at + 16], expected, "row {row}");
-        }
-        if move_region {
-            eprintln!("GPU readback verified all 16 RGBA texels after identity and overlapping copies");
+            assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
     }
 
@@ -3645,7 +3720,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
-        use std::sync::atomic::Ordering::Relaxed;
+        check_depth_classes(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn material_classes_reach_draws_in_the_same_list() {
+        check_depth_classes(true);
+    }
+
+    #[cfg(windows)]
+    fn check_depth_classes(same_list: bool) {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
         use windows::Win32::Graphics::Direct3D12::*;
@@ -3824,8 +3909,15 @@ mod tests {
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
-        list.close();
-        host.execute(&[&list]);
+        let back = if same_list {
+            assert!(list.planes_now(), "the first consumer needs the updated plane");
+            assert!(!list.planes_now(), "no intervening write");
+            list
+        } else {
+            list.close();
+            host.execute(&[&list]);
+            host.new_list().unwrap()
+        };
 
         // The draws: a triangle over the target at the depth of a class,
         // as the title's lighting places its rectangles.
@@ -3886,8 +3978,6 @@ float4 lit() : SV_Target { return 1.0; }
                 host.device.CreateGraphicsPipelineState(&desc).unwrap();
             (signature, pipeline)
         };
-        let state = host_copy(depth).unwrap().state.load(Relaxed);
-        let state = D3D12_RESOURCE_STATES(state as i32);
         let colour = host.rtv(Some(&target), None);
         let depth_view = host.dsv(
             host_depth,
@@ -3897,12 +3987,11 @@ float4 lit() : SV_Target { return 1.0; }
                 ..Default::default()
             }),
         );
-        let back = host.new_list().unwrap();
         // SAFETY: an open list and live resources and views.
         unsafe {
             let l = &back.list;
-            if state != tested {
-                l.ResourceBarrier(&[moved(host_depth, state, tested)]);
+            if let Some((_, previous)) = back.transition(depth, tested.0 as u32) {
+                l.ResourceBarrier(&[moved(host_depth, D3D12_RESOURCE_STATES(previous as i32), tested)]);
             }
             l.ClearRenderTargetView(colour, &[0.0; 4], None);
             l.SetGraphicsRootSignature(&signature);

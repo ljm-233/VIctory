@@ -105,6 +105,17 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// Opt-in trace of the accelerator only, sampled at the OS-to-pad and title API boundaries.
+#[cfg(feature = "diagnostics")]
+fn trace_accelerator(stage: &'static str, last: &AtomicU32, value: f32) {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("VICTORY_TRACE_ACCELERATOR").as_deref() == Ok("1")
+    });
+    if *ENABLED && last.swap(value.to_bits(), Ordering::Relaxed) != value.to_bits() {
+        tracing::info!(stage, value, "accelerator input");
+    }
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -459,6 +470,11 @@ impl State {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        #[cfg(feature = "diagnostics")]
+        if let Some(Value::Pad(pad)) = &fallback {
+            static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+            trace_accelerator("keyboard to virtual RT", &LAST, pad.right_trigger);
+        }
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1010,6 +1026,12 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     let n = keys.len().min(count as usize);
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
+    #[cfg(feature = "diagnostics")]
+    {
+        static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+        let pressed = keys[..n].iter().any(|key| key.virtual_key == b'C');
+        trace_accelerator("title read keyboard C", &LAST, f32::from(u8::from(pressed)));
+    }
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
@@ -1017,6 +1039,11 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
+            #[cfg(feature = "diagnostics")]
+            {
+                static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+                trace_accelerator("title read RT", &LAST, state.right_trigger);
+            }
             true
         }
         _ => false,
