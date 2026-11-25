@@ -11388,7 +11388,15 @@ mod tests {
         };
         assert!(check(0xBF06_800A).is_ok()); // equal to zero
         assert!(check(0xBF07_800A).is_ok()); // unequal to zero
-        assert!(check(0xBF06_870A).is_err()); // literal seven requires the count
+        // This descriptor now exposes its real size through GetDimensions. Comparing
+        // to seven must not consume the single-bit nonempty fallback.
+        let seven = check(0xBF06_870A).expect("numeric comparison on a sized buffer");
+        assert!(seven.user_data.iter().all(|u| u.root != RootType::Other(crate::emit::USER_VIEW_NONEMPTY)));
+        if crate::emit::census::enabled() {
+            let counts = crate::emit::census::take(&seven.dxil).expect("counts for this shader");
+            let dims = crate::emit::census::KINDS.iter().position(|k| *k == "dimensions").unwrap();
+            assert!(counts.counts[dims] > 0, "the numeric comparison must query the descriptor size");
+        }
     }
 
     #[test]

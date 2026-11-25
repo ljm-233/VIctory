@@ -173,7 +173,7 @@ impl<'a> Lower<'a> {
                 {
                     let a = self.scalar[&site];
                     let slot = self.x.native.layout[a.param].slot;
-                    Some(self.host_word(crate::resource::RootType::Other(crate::emit::USER_VIEW_NONEMPTY), slot, a.offset / 4))
+                    Some(self.host_word(crate::RootType::Other(crate::emit::USER_VIEW_NONEMPTY), slot, a.offset / 4))
                 } else {
                     None
                 };
