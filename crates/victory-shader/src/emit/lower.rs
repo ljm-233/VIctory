@@ -10604,8 +10604,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// Each corner packs a nine-bit vertex index and an edge flag in ten bits.
+    /// Bit 31 culls the primitive (all indices zero).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -10638,7 +10638,7 @@ impl<'a> Lower<'a> {
         });
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
