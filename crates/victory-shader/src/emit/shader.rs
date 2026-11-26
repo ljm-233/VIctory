@@ -107,6 +107,10 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// has no size, and the host's copy of what it names may end in the middle of
 /// it (a structure of megabytes crosses the 4 MiB windows).
 pub const USER_ROOT_ADDRESS: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: whether the
+/// view at the root view of root parameter `slot` holds anything (the ray
+/// tracing structure builder reads it before it walks a structure).
+pub const USER_VIEW_NONEMPTY: u32 = 0x105;
 /// `RootType::Other` code of a user-data dword the host sets at a dispatch
 /// counted in threads (the console's `DispatchX`): how many of the threads
 /// numbered along X run (0: all of every group). The metadata's `dword` is
@@ -237,6 +241,10 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// A pixel shader whose writes to views the console orders by primitive
+    /// (POPS): its heap views written or read as UAVs are rasterizer-ordered
+    /// views.
+    pub ordered: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -294,6 +302,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            ordered: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,

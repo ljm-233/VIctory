@@ -5,6 +5,9 @@
 
 use std::path::PathBuf;
 
+#[path = "geometry_identity.rs"]
+pub(crate) mod geometry_identity;
+
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -14,6 +17,63 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
     FOLDER
         .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
         .as_ref()
+}
+
+/// Full scene evidence is opt-in and recorded only on the named title frames.
+pub(crate) fn room_frame(frame: u64) -> bool {
+    static FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let frames = FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_ROOM_FRAMES").unwrap_or_default()
+            .split(',').filter_map(|value| value.trim().parse().ok()).collect()
+    });
+    static AFTER: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let after=AFTER.get_or_init(|| std::env::var("VICTORY_ROOM_WORLD_AFTER").unwrap_or_default()
+        .split(',').filter_map(|v| v.trim().parse().ok()).collect());
+    let first=WORLD.load(std::sync::atomic::Ordering::Acquire);
+    frames.contains(&frame) || (first!=u64::MAX && frame.checked_sub(first).is_some_and(|n|after.contains(&n)))
+        || REQUESTED_ROOM_FRAME.load(std::sync::atomic::Ordering::Acquire)==frame
+}
+static REQUESTED_ROOM_FRAME: std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(u64::MAX);
+
+#[cfg(feature="diagnostics")]
+pub(crate) fn poll_room_request(frame:u64) {
+    static ON: std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    if !ON.get_or_init(|| std::env::var_os("VICTORY_ROOM_TRIGGER").is_some()) { return; }
+    let Some(root)=folder() else{return;};
+    let trigger=root.join("capture-next.txt");
+    if trigger.is_file() && std::fs::rename(&trigger,root.join(format!("request-at-{frame}.txt"))).is_ok() {
+        REQUESTED_ROOM_FRAME.store(frame+2,std::sync::atomic::Ordering::Release);
+        tracing::info!(frame, capture=frame+2, "room capture request accepted");
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn room_constant(address: u64, size: u32) -> Option<String> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    let frame = crate::queue::presented() + 1;
+    if !room_frame(frame) || !matches!(size, 80 | 480 | 656 | 832 | 3424) {
+        return None;
+    }
+    let root = folder()?;
+    let mut bytes = vec![0; size as usize];
+    if !crate::host::read_into(address as *const u8, &mut bytes) { return None; }
+    let digest = blake3::hash(&bytes);
+    static SAVED: OnceLock<Mutex<(u64, HashSet<(u64,u32,blake3::Hash)>)>> = OnceLock::new();
+    let mut seen = SAVED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != frame {
+        seen.0 = frame;
+        seen.1.clear();
+    }
+    let name = format!("frame-{frame}-cbv-{address:x}-{size}-{digest}.bin");
+    if !seen.1.contains(&(address, size, digest)) {
+        if let Err(error) = std::fs::write(root.join(&name), &bytes) {
+            tracing::warn!(%error, %name, "scene constant write failed");
+            return None;
+        }
+        seen.1.insert((address,size,digest));
+    }
+    Some(name)
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -48,7 +108,7 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || room_frame(n) || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -385,14 +445,22 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    let frame = crate::queue::presented() + 1;
+    let general = dump_on() && listed(frame);
+    if resource.is_null() || (!general && !room_frame(frame)) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        targets.push((resource as usize, copy));
+        // SAFETY: host_copy holds this texture until the present.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if general || (desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+            && desc.Width >= 1000 && desc.Width > u64::from(desc.Height)
+            && desc.SampleDesc.Count == 1) {
+            targets.push((resource as usize, copy));
+        }
     }
 }
 
@@ -463,7 +531,17 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let used = (pitch * f.Height as usize).min(buffer.GetDesc().Width as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), used);
+        if room_frame(frame) && d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+            if let Some(root) = folder() {
+                let name = format!("frame-{frame}-depth-{resource:p}-{}x{}-resource{}-plane{}-pitch{}.bin",
+                    f.Width, f.Height, d.Format.0, f.Format.0, f.RowPitch);
+                if let Err(error) = std::fs::write(root.join(&name), rows) {
+                    tracing::warn!(%error, %name, "scene depth write failed");
+                }
+            }
+        }
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {

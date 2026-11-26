@@ -52,22 +52,10 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
-/// Not a pass over the module either: the lowering reads the dwords of one
-/// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
-/// `global_load_dwordx2` to `x4`) by one call for every four of them, not
-/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
-/// From fxceless/victory-fork c36971b2. On an RX 7900 XTX it is worth nothing:
-/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
-/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
-pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+pub const ALL: u32 = MODULE | FIRST;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -75,18 +63,20 @@ pub const DEFAULT: u32 = ALL & !WIDE;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
-    /// A rasterizer ordered view.
-    pub rovs: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
+    /// A handle annotated as a rasterizer-ordered view.
+    pub rovs: bool,
     /// A handle from the view heap.
     pub heap_views: bool,
     /// A handle from the sampler heap.
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A 64-bit float, as a result or an operand.
+    pub doubles: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -402,89 +392,13 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
         };
         let bits = self.int_bits(*ty)?;
         Some((bits, *x as u64 & mask(bits)))
-    }
-
-    /// The bits of a 32-bit float that is a constant, given as one or as a
-    /// cast of an integer constant.
-    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
-        let (v, cast) = match v {
-            V::Inst(i) => match self.insts[i as usize].op {
-                Op::Cast(Cast::Bitcast, x) => (x, true),
-                _ => return None,
-            },
-            _ => (v, false),
-        };
-        let V::Const(i) = v else { return None };
-        match &self.consts[i as usize].1 {
-            Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
-            Const::Int(_) if cast => {
-                let (bits, x) = self.int_k(v)?;
-                (bits == 32).then_some(f32::from_bits(x as u32))
-            }
-            _ => None,
-        }
-    }
-
-    /// For a float that is a number and not an infinity whatever the program
-    /// reads: a power of two its magnitude does not pass.
-    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
-        if let Some(k) = self.float_k(v) {
-            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
-        }
-        let V::Inst(i) = v else { return None };
-        let depth = depth.checked_sub(1)?;
-        let of = |v: V| self.bounded(v, depth);
-        // (A power that overflows, or might with rounding, is no bound.)
-        let held = |b: f32| (b < 126.0).then_some(b);
-        match &self.insts[i as usize].op {
-            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
-            Op::Cast(Cast::Bitcast, x) => match *x {
-                V::Inst(j) => match self.insts[j as usize].op {
-                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
-                    _ => None,
-                },
-                _ => None,
-            },
-            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
-            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
-            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
-            Op::Call(_, args) => {
-                let (_, code) = self.int_k(*args.first()?)?;
-                match (code, &args[1..]) {
-                    // Saturated, a fraction, a cosine or sine (of a number).
-                    (7, [_]) => Some(0.0),
-                    (6, [x]) => of(*x),
-                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
-                    (26..=29, [x]) => held(of(*x)? + 1.0),
-                    // Of two numbers; or one of them the other way round: the
-                    // minimum (36) of a constant and a maximum of another.
-                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
-                        (Some(x), Some(y)) => Some(x.max(y)),
-                        _ => {
-                            let other = if code == 35 { 36 } else { 35 };
-                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
-                            let k = self.float_k(k).and_then(|_| of(k))?;
-                            let V::Inst(j) = inner else { return None };
-                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
-                            let (_, code) = self.int_k(*inner.first()?)?;
-                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
-                            (code == other).then_some(())?;
-                            Some(k.max(of(*low)?))
-                        }
-                    },
-                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
     }
 
     /// The constant `x` of the integer type `ty`, kept sign-extended as
@@ -1058,6 +972,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -1086,7 +1001,11 @@ impl Module {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.doubles |= double(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    u.int64 |= wide(self.type_of(v));
+                    u.doubles |= double(self.type_of(v));
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };
