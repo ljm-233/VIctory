@@ -514,6 +514,12 @@ fn workers() -> bool {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // The translator recurses over a program's blocks and its
+                // shapes: the paired form of a wave64 compute program and a
+                // mesh program of 128 vertices go deep enough that the 2 MiB
+                // a thread starts with is not enough (the thread overflows and
+                // the process is left without a pipeline worker).
+                .stack_size(16 << 20)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself

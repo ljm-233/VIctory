@@ -109,3 +109,75 @@ NVIDIA 的 gpu 层依赖 NVIDIA 在 shader 层加的一批符号，Harvey 的 sh
 它值钱的地方就一处：让那 3 个 BVH 构建程序跑起来，从而能关掉 `BVH_MISS` 和
 `SKIP_PIPELINES`，把光追的反弹光和灯影找回来。这一处值不值得付 308 块，
 要看画面能不能接受现在的「太阳照不到的地方是黑的」。
+
+## 合了（`c7c7b9f`）
+
+按「shader 层取它、gpu 层留我们」做的。308 块冲突里，shader 的 40 块取它，
+gpu 的 268 块取我们，然后补五处接缝：
+
+1. `emit/shader.rs` 留我们的（那八个符号都在这一个文件里），补它的两个名字：
+   `Shader.ordered`（pixel shader 的 UAV 按图元排序）和 `USER_VIEW_NONEMPTY`
+2. `emit/mod.rs` 的 `pub use shader::{…}` 补上我们那八个
+3. `lower.rs` 加 `host_settings()` / `set_host_rdna()` 两个壳 —— 这棵树没有 RDNA
+   浮点模拟，`set_host_rdna` 只记录不用，第四项给 0
+4. `HostShader.half_views` 字段加上，构造点一律填空。它的翻译器把十六位一通道的
+   表读升级到那里去，我们的不升级，所以 host 照常绑描述符。**这是唯一主动关掉的一处**
+5. `emit/host.rs`、`intersect.rs`、`gfx10/`、`ir.rs` 取它的（这些是它的 lower/ir 配套）
+
+### 效果
+
+```
+合并前   compute 2752 / 2763 emitted   （拒 11）
+合并后   compute 2729 / 2734 emitted   （拒  5）
+```
+
+被拒的三个 `XboxBvhBuilder.dll` 和三个 `amd_fidelityfx_upscaler_xbox.dll` 的
+lane mask 程序全部通过。剩下 5 个是 `emit: a descriptor read only as data`，
+其中一个是 `shadowmask:CS_TraceShadowRays_Full`。
+
+**BVH 构建程序能翻译了** —— 这正是 `VICTORY_BVH_MISS=1` 一直在掩盖的东西。
+
+## 第一次跑：崩了，两处原因
+
+### 1. `victory-pipelines-N` 栈溢出，四次
+
+```
+thread 'victory-pipelines-10' (636) has overflowed its stack
+027c:err:virtual:virtual_setup_exception stack overflow 3328 bytes addr 0x1401abcd8
+     stack 0x420d0300 (0x420d0000-0x420d1000-0x430d0000)
+```
+
+栈区间 `0x420d0000-0x430d0000` 已经是 **16 MiB**（`make.rs` 里加了
+`.stack_size(16 << 20)`），还是爆。查地址：`0x1401abcd8` 落在
+`victory_loader::crash::report`（`nm` 定位：`0x1401abcb0` 起）—— 是崩溃处理器
+自己在爆栈，不是根因。真正的递归在上面，还没抓到。四个 worker 死了，进程活着，
+后果是 pipeline 变少、建管线变慢。
+
+### 2. 标题自己的 watchdog（这才是杀死进程的那一下）
+
+```
+VIctory: first-chance exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0x0)
+VIctory: unhandled exception 0xc0000005 at ...+0x23cf683 (write 0x0)
+```
+
+`0x23cf683` 就是 `hooks.rs` 里 `WATCHDOG` 的第二处。原因是启动脚本没设
+`VICTORY_NO_WATCHDOG` —— 第一轮的日志里只有 upscaler 和 render scale 三条
+`hook applied`，没有 watchdog。之后 `dbghelp.dll` 在 WER 写报告时又崩了一次。
+
+## 第二次跑：修完不崩了
+
+加了 `VICTORY_NO_WATCHDOG=1`：
+
+```
+hook applied what="watchdog: skip the call and the fallback fault"
+hook applied what="watchdog: handler's deliberate fault"
+title watchdog hooks (VICTORY_NO_WATCHDOG) applied=2
+```
+
+- **`unhandled exception` 0 次**
+- 进入世界，draws 峰值 4,335
+- **第一次看到白天的场景**（`docs/local/harvey-daylight-hud.png`）：棕榈树、街边的建筑、
+  阳光过曝得厉害（右侧全白）、HUD 正常（毕福 / 格蕾塔、小地图、罗盘）、字幕「我叫杰森。」
+- `swap 14 GiB`，帧率仍然 0 —— 和之前一样的墙
+
+栈溢出那四次依然在（16 MiB 不够说明是真递归），但没让进程死。
