@@ -36,6 +36,19 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
+pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::warm(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no shader cache on this host".into())
+    }
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
@@ -54,17 +67,6 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
 /// the entry was already there, `Ok(false)` when it was translated now, and
 /// `Err` when the translator refuses the container (the refusal is recorded
 /// too, as a run would record it).
-#[cfg(windows)]
-pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
-    victory_gpu::shader_cache::warm(container)
-        .map(|w| w == victory_gpu::shader_cache::Warmed::Cached)
-}
-
-#[cfg(not(windows))]
-pub fn warm_shader(_: &[u8]) -> Result<bool, String> {
-    Err("no shader translation without the host backend".to_owned())
-}
-
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
