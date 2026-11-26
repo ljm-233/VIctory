@@ -537,3 +537,65 @@ Series S 是 6.1-6.4 fps，我们这边连世界都进不去 —— 显存等级
 `copies` 和回读各占几秒，帧时间还得往下压。
 
 日志：`docs/run-xss-breakthrough.log`（10537 那轮）、`docs/run-final-patched.log`（零崩溃这轮）
+
+## 二十三、画面第一次出来（2026-11-26 上午）
+
+`line/main`（作者主线 + PR #798 patch 机制 + watchdog）配九个开关，第一次出了能看的画面。
+
+### 能用的配置
+
+```bash
+VICTORY_INDIRECT_WINDOW=1
+VICTORY_TEXTURE_NO_WAIT=1
+VICTORY_SHADER_LOOP_LIMIT=1024
+VICTORY_TEXTURE_ROOM_PERCENT=82
+VICTORY_TEXTURE_COPIES_MB=1024      # 512 太紧，画面全黑
+VICTORY_TEXTURE_WRITTEN_MB=512
+VICTORY_AMBIENT_STUB=1
+VICTORY_AMBIENT_FLOOR=0.35          # 1.0 反而全黑，0.6 也黑
+VICTORY_SHADOWMASK_STUB=1
+VICTORY_EXPOSURE_STUB=1
+```
+
+### 看到的
+
+**加载画面完全正常**：Lucia 拿枪站在车边，棕榈树、加油站招牌、黄昏色调。
+存为 `loading-lucia.png`。
+
+**世界帧出过一次**：夜空、云、远处城市一整条灯光带、枯树和电线杆剪影、前景站着角色。
+存为 `world-first-frame.png`。
+
+### 不稳定的地方
+
+同一个配置跑四轮，只有 `AMBIENT_FLOOR=0.35` 那轮出了世界，其余（1.0、0.6、以及 0.35 的第一次）都黑屏，
+但 draws 一直在 600-7200 之间跑。**不是参数方向错，是时序不稳定。**
+
+### 顺带发现的事
+
+**`VICTORY_TEXTURE_ROOM_PERCENT=70` 会把画面弄全黑**（avg 4,5,7），82 才正常。说明纹理预算卡太紧时，
+标题不报错，只是画到黑。
+
+**`no host texture` 一次都没出现**，纹理全部创建成功。所以那个「白模」不是纹理缺失，
+更像是夜景 + ambient 太低 —— 世界帧那次是夜晚场景。
+
+**`write-watch journal` 每帧 2288 ms**（2128 次 takings，最长 89.6 ms），这是世界帧里最大的一块，
+比 copies（2877 ms / 103 MB）小不了多少。
+
+### 数字
+
+| | 加载画面 | 世界帧 |
+|---|---|---|
+| fps | 17-30 | 0.3 |
+| ms/frame | 33-58 | 3004-3825 |
+| draws | 10-11 | 636-12299 |
+| copies | 1-8 ms / 1 MB | 820-2877 ms / 86-143 MB |
+| GPU | 0 | 94-1115 ms |
+| 回读 | 0 | 115-627 ms |
+| 崩溃 | 0 | 0 |
+
+### 怎么看到画面的
+
+游戏窗口在 **niri 的 workspace 1**，跑在**笔记本屏 eDP-1** 上（不是 HDMI 那块）。
+截图用 `grim -o eDP-1`。用 `grim` 默认全屏会抓到 workspace 2 的浏览器。
+
+窗口标题自带 fps：`Americas | VIctory <n> fps <ms> ms/frame <k> draws/frame`。
